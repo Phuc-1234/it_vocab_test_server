@@ -14,7 +14,7 @@ const swaggerOptions = {
     info: {
       title: 'IT Vocab Test Api',
       version: '1.0.0',
-      description: 'Express API with MongoDB Atlas and Swagger',
+      description: 'Ok',
     },
     servers: [
       {
