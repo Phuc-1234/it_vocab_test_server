@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const TrashTestSchema = new mongoose.Schema({
-    
+
     weapon: String,
     owner: String,
 
