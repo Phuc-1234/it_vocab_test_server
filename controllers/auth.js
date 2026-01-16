@@ -1,4 +1,5 @@
 // src/controllers/auth.controller.js
+require("dotenv").config();
 const axios = require("axios");
 const { OAuth2Client } = require("google-auth-library");
 const User = require("../models/User.js");

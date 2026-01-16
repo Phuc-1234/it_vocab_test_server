@@ -3,7 +3,7 @@ const express = require("express");
 const router = express.Router();
 
 // GỢI Ý: thay dòng trên bằng:
-const auth = require("../middlewares/authMiddleware");
+const auth = require("../middlewares/authMiddleware.js");
 
 const c = require("../controllers/auth.js");
 
