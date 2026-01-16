@@ -4,7 +4,7 @@ const TrashTest = require('../models/TrashTest.js');
 
 /**
  * @openapi
- * /api/trashTest/all:
+ * /trashTest/all:
  *   get:
  *     summary: test đống rác
  *     responses:
