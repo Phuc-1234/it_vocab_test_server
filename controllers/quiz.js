@@ -589,7 +589,7 @@ module.exports = {
             await attempt.save();
 
             // ===== SR update only for user =====
-            if (isUser) {
+            if (isUser && attempt.mode === "TOPIC") {
                 const now = new Date();
 
                 // load questions to get wordId
@@ -630,13 +630,11 @@ module.exports = {
                     }
 
                     if (st.anyWrong) {
-                        // sai: reset cả hai
                         p.studyLevel = 0;
                         p.nextReviewDate = now;
                         p.lastReviewDate = now;
                         p.reviewState = "NEW";
                     } else if (st.anyCorrect) {
-                        // đúng: tăng level + nextReviewDate theo level
                         p.studyLevel = Math.max(p.studyLevel, 0) + 1;
                         const days = daysForLevel(p.studyLevel);
                         p.lastReviewDate = now;
