@@ -1,3 +1,4 @@
+// controllers/quizAttemptController.js
 const mongoose = require("mongoose");
 const QuizAttempt = require("../models/QuizAttempt");
 const AttemptAnswer = require("../models/AttemptAnswer");
@@ -7,8 +8,27 @@ const Word = require("../models/Word");
 const Topic = require("../models/Topic");
 const UserWordProgress = require("../models/UserWordProgress");
 
+const INFINITE_BATCH_SIZE = 10;
+
 // ===== Helpers =====
 const MODES = ["TOPIC", "RANDOM", "INFINITE", "LEARN"];
+
+/**
+ * Attempt summary DTO (lightweight for Android FE)
+ */
+function attemptDto(attempt) {
+    const total = Array.isArray(attempt.questionIds) ? attempt.questionIds.length : (attempt.totalQuestions || 0);
+    return {
+        attemptId: attempt._id,
+        mode: attempt.mode,
+        topicId: attempt.topicId ?? null,
+        level: attempt.level ?? null,
+        status: attempt.status,
+        totalQuestions: total,
+        correctAnswers: attempt.correctAnswers ?? 0,
+        earnedXP: attempt.earnedXP ?? 0,
+    };
+}
 
 function getGuestKey(req) {
     return String(req.headers["x-guest-key"] || req.body?.guestKey || "").trim() || null;
@@ -18,7 +38,6 @@ function isOwnerAttempt(attempt, req) {
     if (attempt.userId) {
         return req.user?.userId && String(attempt.userId) === String(req.user.userId);
     }
-    // guest
     const gk = getGuestKey(req);
     return gk && attempt.guestKey && gk === attempt.guestKey;
 }
@@ -32,7 +51,6 @@ function normalizeFill(s) {
 
 // SR schedule (bạn có thể chỉnh)
 function daysForLevel(level) {
-    // level: 0..n
     const table = [0, 1, 2, 3, 5, 10, 30, 60];
     return table[Math.min(level, table.length - 1)];
 }
@@ -42,17 +60,44 @@ function calcOverduePenalty(nextReviewDate, studyLevel, now = new Date()) {
     const diffMs = now.getTime() - new Date(nextReviewDate).getTime();
     if (diffMs <= 0) return 0;
     const overdueDays = Math.floor(diffMs / (24 * 60 * 60 * 1000));
-    // quá hạn càng lâu giảm càng nhiều (min để không âm)
     return Math.min(studyLevel, overdueDays);
 }
 
-async function buildQuestionsResponse(questions, includeWordInfo = false) {
+/**
+ * Return a "thin" word object for LEARN mode.
+ * Customize WORD_FIELDS to match your Word schema.
+ */
+const WORD_FIELDS = ["_id", "term", "meaning", "word", "definition", "pronunciation", "example", "audioUrl", "imageUrl"];
+
+function pickWordInfo(w) {
+    if (!w) return null;
+    const out = {};
+    for (const k of WORD_FIELDS) {
+        if (Object.prototype.hasOwnProperty.call(w, k) && w[k] != null) out[k] = w[k];
+    }
+    // always include _id if present
+    if (w._id && !out._id) out._id = w._id;
+    return Object.keys(out).length ? out : { _id: w._id };
+}
+
+/**
+ * Build FE-friendly question DTOs:
+ * {
+ *   questionId, content, questionType, wordId,
+ *   options: [{_id, content}],
+ *   word: null | { ...thin word... }
+ * }
+ */
+async function buildQuestionDtos(questions, includeWordInfo = false) {
     const qIds = questions.map((q) => q._id);
+
     const options = await AnswerOption.find({
         questionId: { $in: qIds },
         deletedAt: null,
         isActive: true,
-    }).lean();
+    })
+        .select("_id questionId content")
+        .lean();
 
     const optByQ = new Map();
     for (const opt of options) {
@@ -61,24 +106,25 @@ async function buildQuestionsResponse(questions, includeWordInfo = false) {
         optByQ.get(k).push({
             _id: opt._id,
             content: opt.content,
-            // đừng trả isCorrect ở lúc đang làm quiz (trừ LEARN nếu bạn muốn)
         });
     }
 
     let wordById = new Map();
     if (includeWordInfo) {
-        const wordIds = [...new Set(questions.map((q) => String(q.wordId)))].map((id) => new mongoose.Types.ObjectId(id));
+        const wordIds = [...new Set(questions.map((q) => String(q.wordId)).filter(Boolean))].map(
+            (id) => new mongoose.Types.ObjectId(id)
+        );
         const words = await Word.find({ _id: { $in: wordIds } }).lean();
         wordById = new Map(words.map((w) => [String(w._id), w]));
     }
 
     return questions.map((q) => ({
-        _id: q._id,
+        questionId: q._id,
         content: q.content,
         questionType: q.questionType,
-        wordId: q.wordId,
+        wordId: q.wordId ?? null,
         options: optByQ.get(String(q._id)) || [],
-        word: includeWordInfo ? wordById.get(String(q.wordId)) || null : undefined,
+        word: includeWordInfo ? pickWordInfo(wordById.get(String(q.wordId)) || null) : null,
     }));
 }
 
@@ -101,7 +147,6 @@ async function pickOneQuestionPerWord(wordIds) {
 }
 
 async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10 }) {
-    // lọc words theo topic + level
     if (isGuest) {
         const words = await Word.find({
             topicId,
@@ -152,7 +197,7 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
                 studyLevelSort: { $ifNull: ["$p.studyLevel", 0] },
             },
         },
-        // ưu tiên nextReviewDate sớm nhất, rồi studyLevel thấp (chưa học)
+        // ưu tiên nextReviewDate sớm nhất, rồi studyLevel thấp
         { $sort: { nextReviewDateSort: 1, studyLevelSort: 1, _id: 1 } },
         { $limit: limit },
         { $project: { _id: 1 } },
@@ -161,12 +206,155 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
     return rows.map((r) => String(r._id));
 }
 
+/**
+ * Attach attemptAnswer object into each question item (consistent shape)
+ * - attemptAnswer: {_id, selectedOptionId, answerText, isCorrect, answeredAt}
+ */
+async function attachAttemptAnswers({ attemptId, questionsDto }) {
+    const qIds = questionsDto.map((q) => q.questionId);
+
+    const answers = await AttemptAnswer.find({
+        attemptId,
+        questionId: { $in: qIds },
+    })
+        .select("_id questionId selectedOptionId answerText isCorrect answeredAt")
+        .lean();
+
+    const ansByQ = new Map(answers.map((a) => [String(a.questionId), a]));
+
+    return questionsDto.map((q) => {
+        const a = ansByQ.get(String(q.questionId)) || null;
+
+        let selectedOptionId = a?.selectedOptionId ?? null;
+        let answerText = a?.answerText ?? null;
+
+        if (a) {
+            if (q.questionType === "FILL_BLANK") selectedOptionId = null;
+            else answerText = null;
+        }
+
+        return {
+            ...q,
+            attemptAnswer: a
+                ? {
+                    _id: a._id,
+                    selectedOptionId,
+                    answerText,
+                    isCorrect: a.isCorrect,
+                    answeredAt: a.answeredAt,
+                }
+                : null,
+        };
+    });
+}
+
+async function ensureInfiniteNextBatchIfNeeded(attempt) {
+    // gọi khi: attempt.mode === INFINITE và cursor next >= attempt.questionIds.length
+    const more = await Question.find({
+        isActive: true,
+        deletedAt: null,
+        _id: { $nin: attempt.questionIds },
+    })
+        .sort({ _id: 1 })
+        .limit(INFINITE_BATCH_SIZE)
+        .lean();
+
+    if (!more.length) return { appended: false, newIds: [] };
+
+    const existedNow = new Set(attempt.questionIds.map((x) => String(x)));
+    const newIds = more.map((q) => q._id).filter((id) => !existedNow.has(String(id)));
+
+    if (!newIds.length) return { appended: false, newIds: [] };
+
+    attempt.questionIds.push(...newIds);
+    attempt.totalQuestions = attempt.questionIds.length;
+    await attempt.save();
+
+    try {
+        await AttemptAnswer.insertMany(
+            newIds.map((qid) => ({
+                attemptId: attempt._id,
+                questionId: qid,
+                answeredAt: null,
+                selectedOptionId: null,
+                answerText: null,
+                isCorrect: null,
+            })),
+            { ordered: false }
+        );
+    } catch (err) {
+        if (err?.code !== 11000) throw err;
+    }
+
+    return { appended: true, newIds };
+}
+
+async function gradeAndSaveAttemptAnswer({ aa, question, selectedOptionId, answerText }) {
+    let isCorrect = false;
+
+    // extra info for FE (to show correct answer after submit)
+    let correctOptionId = null;
+    let correctAnswers = null;
+
+    if (question.questionType === "MULTIPLE_CHOICE" || question.questionType === "TRUE_FALSE") {
+        if (!selectedOptionId) {
+            return { ok: false, status: 400, message: "Thiếu selectedOptionId." };
+        }
+
+        const correctOpt = await AnswerOption.findOne({
+            questionId: question._id,
+            isCorrect: true,
+            deletedAt: null,
+            isActive: true,
+        })
+            .select("_id")
+            .lean();
+
+        if (!correctOpt) {
+            return { ok: false, status: 500, message: "Câu hỏi thiếu đáp án đúng." };
+        }
+
+        correctOptionId = correctOpt._id;
+        isCorrect = String(correctOpt._id) === String(selectedOptionId);
+        aa.selectedOptionId = selectedOptionId;
+        aa.answerText = null;
+    } else if (question.questionType === "FILL_BLANK") {
+        if (!answerText) {
+            return { ok: false, status: 400, message: "Thiếu answerText." };
+        }
+
+        const correctOpts = await AnswerOption.find({
+            questionId: question._id,
+            isCorrect: true,
+            deletedAt: null,
+            isActive: true,
+        })
+            .select("content")
+            .lean();
+
+        const normalized = normalizeFill(answerText);
+        isCorrect = correctOpts.some((o) => normalizeFill(o.content) === normalized);
+
+        correctAnswers = correctOpts.map((o) => o.content);
+
+        aa.answerText = answerText;
+        aa.selectedOptionId = null;
+    } else {
+        return { ok: false, status: 400, message: "questionType không hỗ trợ." };
+    }
+
+    aa.isCorrect = isCorrect;
+    aa.answeredAt = new Date();
+    await aa.save();
+
+    return { ok: true, isCorrect, correctOptionId, correctAnswers };
+}
+
 // ===== Controllers =====
 module.exports = {
     /**
-   * GET /quizzes/topics?page=1&pageSize=20
-   * items: [{ topicId, level, title, mode }]
-   */
+     * GET /quizzes/topics?page=1&pageSize=20
+     */
     async quizzesByTopicsPaginated(req, res) {
         try {
             const { page = 1, pageSize = 20 } = req.query;
@@ -174,7 +362,7 @@ module.exports = {
             const p = Math.max(1, parseInt(page, 10) || 1);
             const ps = Math.max(1, Math.min(parseInt(pageSize, 10) || 20, 100));
 
-            const topics = await Topic.find({ /* isActive: true, deletedAt: null */ })
+            const topics = await Topic.find({})
                 .select("_id topicName maxLevel")
                 .sort({ topicName: 1, _id: 1 })
                 .lean();
@@ -183,7 +371,7 @@ module.exports = {
                 return res.json({ page: p, pageSize: ps, total: 0, totalPages: 0, items: [] });
             }
 
-            const levelsByTopic = topics.map(t => Math.max(1, Number(t.maxLevel || 1)));
+            const levelsByTopic = topics.map((t) => Math.max(1, Number(t.maxLevel || 1)));
             const total = levelsByTopic.reduce((acc, x) => acc + x, 0);
             const totalPages = Math.ceil(total / ps);
 
@@ -194,7 +382,7 @@ module.exports = {
             const end = Math.min(start + ps, total);
 
             const items = [];
-            let cursor = 0; // global index trong danh sách quiz ảo
+            let cursor = 0;
 
             for (let i = 0; i < topics.length && cursor < end; i++) {
                 const topic = topics[i];
@@ -224,25 +412,15 @@ module.exports = {
                 cursor = topicEnd;
             }
 
-            return res.json({
-                page: p,
-                pageSize: ps,
-                total,
-                totalPages,
-                items,
-            });
+            return res.json({ page: p, pageSize: ps, total, totalPages, items });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
 
-
     /**
      * POST /quiz-attempts
-     * Body:
-     *  - mode: TOPIC|RANDOM|INFINITE|LEARN
-     *  - topicId, level (TOPIC/LEARN)
-     *  - totalQuestions? (default 10)
+     * Flow "1 câu 1 màn": trả về cursor=0 + question đầu tiên
      */
     async start(req, res) {
         try {
@@ -256,25 +434,23 @@ module.exports = {
             const isUser = !!req.user?.userId;
             const guestKey = getGuestKey(req);
 
-            // ===== guest rules =====
+            // guest rules
             if (!isUser) {
                 if (!guestKey) return res.status(401).json({ message: "Guest cần x-guest-key." });
-
                 if (!["RANDOM", "TOPIC"].includes(m)) {
                     return res.status(403).json({ message: "Guest chỉ được RANDOM hoặc TOPIC." });
                 }
-
                 if (m === "TOPIC" && Number(level) !== 1) {
                     return res.status(403).json({ message: "Guest TOPIC chỉ được level 1." });
                 }
             }
 
-            // ===== user rules =====
+            // user rules
             if ((m === "LEARN" || m === "INFINITE") && !isUser) {
                 return res.status(401).json({ message: "Chế độ này yêu cầu đăng nhập." });
             }
 
-            // ✅ ===== block if already has IN_PROGRESS attempt =====
+            // block if already IN_PROGRESS
             const inProgressFilter = isUser
                 ? { userId: req.user.userId, status: "IN_PROGRESS" }
                 : { guestKey, status: "IN_PROGRESS" };
@@ -285,14 +461,19 @@ module.exports = {
 
             if (existing) {
                 return res.status(409).json({
-                    message: "Bạn đang có một quiz đang làm dở. Vui lòng hoàn thành hoặc bỏ quiz hiện tại trước khi bắt đầu quiz mới.",
+                    message:
+                        "Bạn đang có một quiz đang làm dở. Vui lòng hoàn thành hoặc bỏ quiz hiện tại trước khi bắt đầu quiz mới.",
                     inProgressAttempt: existing,
                 });
             }
 
-            const n = Math.max(1, Math.min(Number(totalQuestions || 10), 50));
+            // INFINITE always 10
+            const n =
+                m === "INFINITE"
+                    ? INFINITE_BATCH_SIZE
+                    : Math.max(1, Math.min(Number(totalQuestions || 10), 50));
 
-            // ===== pick questions =====
+            // pick questions
             let questions = [];
 
             if (m === "RANDOM") {
@@ -324,7 +505,6 @@ module.exports = {
 
                 questions = await pickOneQuestionPerWord(wordIds);
 
-                // nếu thiếu câu (word thiếu question), fallback random
                 if (questions.length < n) {
                     const missing = n - questions.length;
                     const extra = await Question.aggregate([
@@ -341,7 +521,7 @@ module.exports = {
 
             const questionIds = questions.map((q) => q._id);
 
-            // ===== create attempt =====
+            // create attempt
             const attempt = await QuizAttempt.create({
                 userId: isUser ? req.user.userId : null,
                 isGuest: !isUser,
@@ -360,7 +540,7 @@ module.exports = {
                 startedAt: new Date(),
             });
 
-            // ===== create AttemptAnswer skeletons =====
+            // create AttemptAnswer skeletons
             await AttemptAnswer.insertMany(
                 questionIds.map((qid) => ({
                     attemptId: attempt._id,
@@ -373,23 +553,24 @@ module.exports = {
                 { ordered: false }
             );
 
-            const includeWordInfo = m === "LEARN";
-            const questionsFull = await buildQuestionsResponse(
-                await Question.find({ _id: { $in: questionIds } }).lean(),
-                includeWordInfo
-            );
+            // ===== return ONLY first question (cursor=0) =====
+            const firstId = attempt.questionIds[0];
+            const firstQ = await Question.findById(firstId).lean();
+            if (!firstQ) return res.status(500).json({ message: "Lỗi dữ liệu: thiếu câu đầu tiên." });
+
+            const includeWordInfo = attempt.mode === "LEARN";
+            const [firstDto] = await buildQuestionDtos([firstQ], includeWordInfo);
+            const [mergedFirst] = await attachAttemptAnswers({ attemptId: attempt._id, questionsDto: [firstDto] });
+
+            const total = attempt.questionIds.length;
+            const canNext = total > 1 || attempt.mode === "INFINITE";
 
             return res.status(201).json({
-                attempt: {
-                    _id: attempt._id,
-                    mode: attempt.mode,
-                    topicId: attempt.topicId,
-                    level: attempt.level,
-                    totalQuestions: attempt.totalQuestions,
-                    status: attempt.status,
-                    createdAt: attempt.createdAt,
-                },
-                questions: questionsFull,
+                attempt: attemptDto(attempt),
+                cursor: 0,
+                canPrev: false,
+                canNext,
+                question: mergedFirst,
             });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
@@ -397,24 +578,390 @@ module.exports = {
     },
 
     /**
-     * GET /quiz-attempts/:attemptId
-     * Lấy lại attempt đang làm + AttemptAnswers + questions/options
+     * GET /quiz-attempts/:attemptId/questions/:cursor
+     */
+    async getQuestionByCursor(req, res) {
+        try {
+            const { attemptId, cursor } = req.params;
+            const idx = Math.max(0, parseInt(cursor, 10) || 0);
+
+            const attempt = await QuizAttempt.findById(attemptId).lean();
+            if (!attempt) return res.status(404).json({ message: "Attempt không tồn tại." });
+
+            if (!isOwnerAttempt(attempt, req)) {
+                return res.status(403).json({ message: "Không có quyền truy cập attempt." });
+            }
+
+            const total = attempt.questionIds.length;
+
+            if (idx >= total) {
+                if (attempt.mode === "INFINITE") {
+                    return res.status(409).json({
+                        message:
+                            "Chưa có batch mới cho cursor này. Hãy submit câu trước đó (auto next-batch) hoặc gọi next-batch.",
+                        requireNextBatch: true,
+                        cursor: idx,
+                        totalQuestions: total,
+                    });
+                }
+                return res.status(404).json({
+                    message: "Cursor vượt quá số câu hiện có.",
+                    cursor: idx,
+                    totalQuestions: total,
+                });
+            }
+
+            const questionId = attempt.questionIds[idx];
+
+            const q = await Question.findById(questionId).lean();
+            if (!q) return res.status(404).json({ message: "Question không tồn tại." });
+
+            const includeWordInfo = attempt.mode === "LEARN";
+            const [qDto] = await buildQuestionDtos([q], includeWordInfo);
+
+            const merged = (await attachAttemptAnswers({ attemptId: attempt._id, questionsDto: [qDto] }))[0];
+
+            return res.json({
+                attempt: attemptDto(attempt),
+                cursor: idx,
+                canPrev: idx > 0,
+                canNext: idx + 1 < total || attempt.mode === "INFINITE",
+                question: merged,
+            });
+        } catch (e) {
+            return res.status(500).json({ message: "Lỗi server.", error: e.message });
+        }
+    },
+
+    /**
+     * POST /quiz-attempts/:attemptId/submit
+     */
+    async submitAndNext(req, res) {
+        try {
+            const { attemptId } = req.params;
+            const { cursor, attemptAnswerId, selectedOptionId, answerText } = req.body || {};
+            const idx = Math.max(0, parseInt(cursor, 10) || 0);
+
+            const attempt = await QuizAttempt.findById(attemptId);
+            if (!attempt) return res.status(404).json({ message: "Attempt không tồn tại." });
+
+            if (!isOwnerAttempt(attempt, req)) return res.status(403).json({ message: "Không có quyền." });
+            if (attempt.status !== "IN_PROGRESS") return res.status(400).json({ message: "Attempt đã kết thúc/bỏ." });
+
+            if (!attempt.questionIds || idx >= attempt.questionIds.length) {
+                return res.status(400).json({
+                    message: "Cursor không hợp lệ (vượt quá số câu hiện có).",
+                    cursor: idx,
+                    totalQuestions: attempt.questionIds.length,
+                });
+            }
+
+            const qid = attempt.questionIds[idx];
+
+            // load AttemptAnswer
+            let aa = null;
+            if (attemptAnswerId) {
+                aa = await AttemptAnswer.findById(attemptAnswerId);
+                if (!aa) return res.status(404).json({ message: "AttemptAnswer không tồn tại." });
+
+                if (String(aa.attemptId) !== String(attempt._id) || String(aa.questionId) !== String(qid)) {
+                    return res.status(400).json({ message: "attemptAnswerId không khớp attempt/question." });
+                }
+            } else {
+                aa = await AttemptAnswer.findOne({ attemptId: attempt._id, questionId: qid });
+                if (!aa) return res.status(404).json({ message: "AttemptAnswer không tồn tại." });
+            }
+
+            const question = await Question.findById(qid).lean();
+            if (!question) return res.status(404).json({ message: "Question không tồn tại." });
+
+            // =========================================================
+            // ✅ CÁCH 1: Idempotent submit (gọi 2 lần vẫn trả y như lần đầu)
+            // Nếu câu này đã được trả lời rồi -> KHÔNG chấm lại, chỉ trả lại kết quả cũ + next
+            // =========================================================
+            if (aa.answeredAt) {
+                let correctOptionId = null;
+                let correctAnswers = null;
+
+                if (question.questionType === "MULTIPLE_CHOICE" || question.questionType === "TRUE_FALSE") {
+                    const correctOpt = await AnswerOption.findOne({
+                        questionId: question._id,
+                        isCorrect: true,
+                        deletedAt: null,
+                        isActive: true,
+                    })
+                        .select("_id")
+                        .lean();
+                    correctOptionId = correctOpt?._id ?? null;
+                } else if (question.questionType === "FILL_BLANK") {
+                    const correctOpts = await AnswerOption.find({
+                        questionId: question._id,
+                        isCorrect: true,
+                        deletedAt: null,
+                        isActive: true,
+                    })
+                        .select("content")
+                        .lean();
+                    correctAnswers = correctOpts.map((o) => o.content);
+                }
+
+                let nextCursor = idx + 1;
+                let batchAppended = false;
+
+                // nếu next vượt tổng hiện có
+                if (nextCursor >= attempt.questionIds.length) {
+                    if (attempt.mode === "INFINITE") {
+                        if (!attempt.userId) return res.status(401).json({ message: "Chế độ này yêu cầu đăng nhập." });
+
+                        const rs = await ensureInfiniteNextBatchIfNeeded(attempt);
+                        batchAppended = rs.appended;
+
+                        if (!rs.appended) {
+                            return res.json({
+                                attempt: attemptDto(attempt),
+                                current: {
+                                    cursor: idx,
+                                    result: {
+                                        attemptAnswerId: aa._id,
+                                        isCorrect: aa.isCorrect,
+                                        correctOptionId,
+                                        correctAnswers,
+                                    },
+                                },
+                                next: null,
+                                finished: true,
+                                canFinish: true,
+                                batchAppended: false,
+                                message: "Hết câu hỏi (INFINITE).",
+                            });
+                        }
+                    } else {
+                        return res.json({
+                            attempt: attemptDto(attempt),
+                            current: {
+                                cursor: idx,
+                                result: {
+                                    attemptAnswerId: aa._id,
+                                    isCorrect: aa.isCorrect,
+                                    correctOptionId,
+                                    correctAnswers,
+                                },
+                            },
+                            next: null,
+                            finished: true,
+                            canFinish: true,
+                            batchAppended: false,
+                        });
+                    }
+                }
+
+                // load next question
+                const nextQid = attempt.questionIds[nextCursor];
+                const nextQ = await Question.findById(nextQid).lean();
+                if (!nextQ) {
+                    return res.json({
+                        attempt: attemptDto(attempt),
+                        current: {
+                            cursor: idx,
+                            result: {
+                                attemptAnswerId: aa._id,
+                                isCorrect: aa.isCorrect,
+                                correctOptionId,
+                                correctAnswers,
+                            },
+                        },
+                        next: null,
+                        finished: true,
+                        canFinish: true,
+                        batchAppended,
+                        message: "Không tìm thấy câu tiếp theo.",
+                    });
+                }
+
+                const includeWordInfo = attempt.mode === "LEARN";
+                const [nextDto] = await buildQuestionDtos([nextQ], includeWordInfo);
+                const [mergedNext] = await attachAttemptAnswers({ attemptId: attempt._id, questionsDto: [nextDto] });
+
+                return res.json({
+                    attempt: attemptDto(attempt),
+                    current: {
+                        cursor: idx,
+                        result: {
+                            attemptAnswerId: aa._id,
+                            isCorrect: aa.isCorrect,
+                            correctOptionId,
+                            correctAnswers,
+                        },
+                    },
+                    batchAppended,
+                    next: {
+                        cursor: nextCursor,
+                        question: mergedNext,
+                    },
+                    finished: false,
+                });
+            }
+
+            // =========================================================
+            // Normal flow: grade & save lần đầu
+            // =========================================================
+            const graded = await gradeAndSaveAttemptAnswer({ aa, question, selectedOptionId, answerText });
+            if (!graded.ok) {
+                return res.status(graded.status).json({ message: graded.message });
+            }
+
+            // next cursor
+            let nextCursor = idx + 1;
+            let batchAppended = false;
+
+            // nếu next vượt tổng hiện có
+            if (nextCursor >= attempt.questionIds.length) {
+                if (attempt.mode === "INFINITE") {
+                    if (!attempt.userId) return res.status(401).json({ message: "Chế độ này yêu cầu đăng nhập." });
+
+                    const rs = await ensureInfiniteNextBatchIfNeeded(attempt);
+                    batchAppended = rs.appended;
+
+                    if (!rs.appended) {
+                        return res.json({
+                            attempt: attemptDto(attempt),
+                            current: {
+                                cursor: idx,
+                                result: {
+                                    attemptAnswerId: aa._id,
+                                    isCorrect: graded.isCorrect,
+                                    correctOptionId: graded.correctOptionId ?? null,
+                                    correctAnswers: graded.correctAnswers ?? null,
+                                },
+                            },
+                            next: null,
+                            finished: true,
+                            canFinish: true,
+                            batchAppended: false,
+                            message: "Hết câu hỏi (INFINITE).",
+                        });
+                    }
+                } else {
+                    return res.json({
+                        attempt: attemptDto(attempt),
+                        current: {
+                            cursor: idx,
+                            result: {
+                                attemptAnswerId: aa._id,
+                                isCorrect: graded.isCorrect,
+                                correctOptionId: graded.correctOptionId ?? null,
+                                correctAnswers: graded.correctAnswers ?? null,
+                            },
+                        },
+                        next: null,
+                        finished: true,
+                        canFinish: true,
+                        batchAppended: false,
+                    });
+                }
+            }
+
+            // load next question
+            const nextQid = attempt.questionIds[nextCursor];
+            const nextQ = await Question.findById(nextQid).lean();
+            if (!nextQ) {
+                return res.json({
+                    attempt: attemptDto(attempt),
+                    current: {
+                        cursor: idx,
+                        result: {
+                            attemptAnswerId: aa._id,
+                            isCorrect: graded.isCorrect,
+                            correctOptionId: graded.correctOptionId ?? null,
+                            correctAnswers: graded.correctAnswers ?? null,
+                        },
+                    },
+                    next: null,
+                    finished: true,
+                    canFinish: true,
+                    batchAppended,
+                    message: "Không tìm thấy câu tiếp theo.",
+                });
+            }
+
+            const includeWordInfo = attempt.mode === "LEARN";
+            const [nextDto] = await buildQuestionDtos([nextQ], includeWordInfo);
+            const [mergedNext] = await attachAttemptAnswers({ attemptId: attempt._id, questionsDto: [nextDto] });
+
+            return res.json({
+                attempt: attemptDto(attempt),
+                current: {
+                    cursor: idx,
+                    result: {
+                        attemptAnswerId: aa._id,
+                        isCorrect: graded.isCorrect,
+                        correctOptionId: graded.correctOptionId ?? null,
+                        correctAnswers: graded.correctAnswers ?? null,
+                    },
+                },
+                batchAppended,
+                next: {
+                    cursor: nextCursor,
+                    question: mergedNext,
+                },
+                finished: false,
+            });
+        } catch (e) {
+            return res.status(500).json({ message: "Lỗi server.", error: e.message });
+        }
+    },
+
+    /**
+     * GET /quiz-attempts/:attemptId?page=1&pageSize=10
      */
     async getAttempt(req, res) {
         try {
             const { attemptId } = req.params;
+            const { page = 1, pageSize = 10 } = req.query;
+
             const attempt = await QuizAttempt.findById(attemptId).lean();
             if (!attempt) return res.status(404).json({ message: "Attempt không tồn tại." });
 
-            if (!isOwnerAttempt(attempt, req)) return res.status(403).json({ message: "Không có quyền truy cập attempt." });
+            if (!isOwnerAttempt(attempt, req)) {
+                return res.status(403).json({ message: "Không có quyền truy cập attempt." });
+            }
 
-            const answers = await AttemptAnswer.find({ attemptId: attempt._id }).lean();
-            const questions = await Question.find({ _id: { $in: attempt.questionIds } }).lean();
+            const p = Math.max(1, parseInt(page, 10) || 1);
+            const ps = Math.max(1, Math.min(parseInt(pageSize, 10) || 10, 50));
+
+            const total = attempt.questionIds.length;
+            const totalPages = Math.ceil(total / ps);
+            const skip = (p - 1) * ps;
+
+            const pageIds = attempt.questionIds.slice(skip, skip + ps);
+            if (!pageIds.length) {
+                return res.json({
+                    attempt: attemptDto(attempt),
+                    page: p,
+                    pageSize: ps,
+                    totalQuestions: total,
+                    totalPages,
+                    questions: [],
+                });
+            }
+
+            const questions = await Question.find({ _id: { $in: pageIds } }).lean();
+
+            const qById = new Map(questions.map((q) => [String(q._id), q]));
+            const orderedQuestions = pageIds.map((id) => qById.get(String(id))).filter(Boolean);
 
             const includeWordInfo = attempt.mode === "LEARN";
-            const questionsFull = await buildQuestionsResponse(questions, includeWordInfo);
+            const questionsDto = await buildQuestionDtos(orderedQuestions, includeWordInfo);
+            const merged = await attachAttemptAnswers({ attemptId: attempt._id, questionsDto });
 
-            return res.json({ attempt, answers, questions: questionsFull });
+            return res.json({
+                attempt: attemptDto(attempt),
+                page: p,
+                pageSize: ps,
+                totalQuestions: total,
+                totalPages,
+                questions: merged,
+            });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
@@ -422,7 +969,6 @@ module.exports = {
 
     /**
      * POST /quiz-attempts/:attemptId/next-batch
-     * Chỉ INFINITE + chỉ User (JWT)
      */
     async nextBatch(req, res) {
         try {
@@ -439,40 +985,56 @@ module.exports = {
             if (attempt.mode !== "INFINITE") return res.status(400).json({ message: "Chỉ hỗ trợ INFINITE." });
             if (attempt.status !== "IN_PROGRESS") return res.status(400).json({ message: "Attempt đã kết thúc/bỏ." });
 
-            const n = 10;
-
-            const existed = new Set(attempt.questionIds.map((x) => String(x)));
-
             const more = await Question.find({
                 isActive: true,
                 deletedAt: null,
                 _id: { $nin: attempt.questionIds },
             })
                 .sort({ _id: 1 })
-                .limit(n)
+                .limit(INFINITE_BATCH_SIZE)
                 .lean();
 
-            if (!more.length) return res.json({ items: [], message: "Hết câu hỏi." });
+            if (!more.length) {
+                return res.json({ items: [], message: "Hết câu hỏi.", totalQuestions: attempt.questionIds.length });
+            }
 
-            const newIds = more.map((q) => q._id).filter((id) => !existed.has(String(id)));
+            const existedNow = new Set(attempt.questionIds.map((x) => String(x)));
+            const newIds = more.map((q) => q._id).filter((id) => !existedNow.has(String(id)));
+
+            if (!newIds.length) {
+                return res.json({
+                    items: [],
+                    message: "Không có câu mới (có thể bạn bấm next-batch liên tục).",
+                    totalQuestions: attempt.questionIds.length,
+                });
+            }
 
             attempt.questionIds.push(...newIds);
             attempt.totalQuestions = attempt.questionIds.length;
             await attempt.save();
 
-            await AttemptAnswer.insertMany(
-                newIds.map((qid) => ({
-                    attemptId: attempt._id,
-                    questionId: qid,
-                    answeredAt: null,
-                    selectedOptionId: null,
-                    answerText: null,
-                    isCorrect: null,
-                })),
-                { ordered: false }
-            );
+            try {
+                await AttemptAnswer.insertMany(
+                    newIds.map((qid) => ({
+                        attemptId: attempt._id,
+                        questionId: qid,
+                        answeredAt: null,
+                        selectedOptionId: null,
+                        answerText: null,
+                        isCorrect: null,
+                    })),
+                    { ordered: false }
+                );
+            } catch (err) {
+                if (err?.code !== 11000) throw err;
+            }
 
-            const items = await buildQuestionsResponse(more, false);
+            const qById = new Map(more.map((q) => [String(q._id), q]));
+            const orderedMore = newIds.map((id) => qById.get(String(id))).filter(Boolean);
+
+            const questionsDto = await buildQuestionDtos(orderedMore, false);
+            const items = await attachAttemptAnswers({ attemptId: attempt._id, questionsDto });
+
             return res.json({ items, totalQuestions: attempt.totalQuestions });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
@@ -481,9 +1043,6 @@ module.exports = {
 
     /**
      * PUT /attempt-answers/:attemptAnswerId
-     * Body:
-     *  - selectedOptionId (MCQ/TRUE_FALSE)
-     *  - answerText (FILL_BLANK)
      */
     async updateAnswer(req, res) {
         try {
@@ -505,49 +1064,15 @@ module.exports = {
             const question = await Question.findById(aa.questionId).lean();
             if (!question) return res.status(404).json({ message: "Question không tồn tại." });
 
-            // chấm
-            let isCorrect = false;
+            const graded = await gradeAndSaveAttemptAnswer({ aa, question, selectedOptionId, answerText });
+            if (!graded.ok) return res.status(graded.status).json({ message: graded.message });
 
-            if (question.questionType === "MULTIPLE_CHOICE" || question.questionType === "TRUE_FALSE") {
-                if (!selectedOptionId) return res.status(400).json({ message: "Thiếu selectedOptionId." });
-
-                const correctOpt = await AnswerOption.findOne({
-                    questionId: question._id,
-                    isCorrect: true,
-                    deletedAt: null,
-                    isActive: true,
-                }).lean();
-
-                if (!correctOpt) return res.status(500).json({ message: "Câu hỏi thiếu đáp án đúng." });
-
-                isCorrect = String(correctOpt._id) === String(selectedOptionId);
-
-                aa.selectedOptionId = selectedOptionId;
-                aa.answerText = null;
-            } else if (question.questionType === "FILL_BLANK") {
-                if (!answerText) return res.status(400).json({ message: "Thiếu answerText." });
-
-                const correctOpts = await AnswerOption.find({
-                    questionId: question._id,
-                    isCorrect: true,
-                    deletedAt: null,
-                    isActive: true,
-                }).lean();
-
-                const normalized = normalizeFill(answerText);
-                isCorrect = correctOpts.some((o) => normalizeFill(o.content) === normalized);
-
-                aa.answerText = answerText;
-                aa.selectedOptionId = null;
-            } else {
-                return res.status(400).json({ message: "questionType không hỗ trợ." });
-            }
-
-            aa.isCorrect = isCorrect;
-            aa.answeredAt = new Date();
-            await aa.save();
-
-            return res.json({ attemptAnswerId: aa._id, isCorrect });
+            return res.json({
+                attemptAnswerId: aa._id,
+                isCorrect: graded.isCorrect,
+                correctOptionId: graded.correctOptionId ?? null,
+                correctAnswers: graded.correctAnswers ?? null,
+            });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
@@ -555,8 +1080,6 @@ module.exports = {
 
     /**
      * POST /quiz-attempts/:attemptId/finish
-     * - Guest: chỉ tổng kết attempt, KHÔNG update SR/XP
-     * - User: update SR + XP (LEARN => XP=0)
      */
     async finish(req, res) {
         try {
@@ -576,11 +1099,10 @@ module.exports = {
             attempt.totalQuestions = total;
             attempt.correctAnswers = correct;
 
-            // XP rule
             const isUser = !!attempt.userId;
             let earnedXP = 0;
             if (isUser && attempt.mode !== "LEARN") {
-                earnedXP = correct * 5; // bạn đổi công thức tuỳ ý
+                earnedXP = correct * 5;
             }
             attempt.earnedXP = earnedXP;
 
@@ -588,17 +1110,15 @@ module.exports = {
             attempt.finishedAt = new Date();
             await attempt.save();
 
-            // ===== SR update only for user =====
+            // SR update only for user + TOPIC
             if (isUser && attempt.mode === "TOPIC") {
                 const now = new Date();
 
-                // load questions to get wordId
                 const questions = await Question.find({ _id: { $in: attempt.questionIds } })
                     .select("_id wordId")
                     .lean();
                 const qToWord = new Map(questions.map((q) => [String(q._id), String(q.wordId)]));
 
-                // aggregate per word: nếu có bất kỳ sai => reset
                 const wordAgg = new Map();
                 for (const a of answers) {
                     const wid = qToWord.get(String(a.questionId));
@@ -610,7 +1130,6 @@ module.exports = {
                 }
 
                 for (const [wordId, st] of wordAgg.entries()) {
-                    // upsert progress
                     let p = await UserWordProgress.findOne({ userId: attempt.userId, wordId });
                     if (!p) {
                         p = await UserWordProgress.create({
@@ -623,7 +1142,6 @@ module.exports = {
                         });
                     }
 
-                    // overdue penalty first
                     const penalty = calcOverduePenalty(p.nextReviewDate, p.studyLevel, now);
                     if (penalty > 0) {
                         p.studyLevel = Math.max(p.studyLevel - penalty, 0);
@@ -651,6 +1169,7 @@ module.exports = {
                 totalQuestions: attempt.totalQuestions,
                 correctAnswers: attempt.correctAnswers,
                 earnedXP: attempt.earnedXP,
+                status: attempt.status,
             });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
@@ -659,14 +1178,10 @@ module.exports = {
 
     /**
      * GET /quiz-attempts?mode=&topicId=&from=&to=&page=1&pageSize=20
-     * /quiz-attempts?page=1&pageSize=20
-     * /quiz-attempts?mode=TOPIC&topicId=...&page=2&pageSize=10
-     * /quiz-attempts?from=2026-01-01&to=2026-01-31&page=1&pageSize=20
      */
     async history(req, res) {
         try {
             const userId = req.user.userId;
-
             const { mode, topicId, from, to, page = 1, pageSize = 20 } = req.query;
 
             const filter = { userId };
@@ -682,7 +1197,6 @@ module.exports = {
 
             const p = Math.max(1, parseInt(page, 10) || 1);
             const ps = Math.max(1, Math.min(parseInt(pageSize, 10) || 20, 100));
-
             const skip = (p - 1) * ps;
 
             const [items, total] = await Promise.all([
@@ -697,22 +1211,27 @@ module.exports = {
 
             const totalPages = Math.ceil(total / ps);
 
-            return res.json({
-                page: p,
-                pageSize: ps,
-                total,
-                totalPages,
-                items,
-            });
+            const mapped = items.map((it) => ({
+                attemptId: it._id,
+                mode: it.mode,
+                topicId: it.topicId ?? null,
+                level: it.level ?? null,
+                totalQuestions: it.totalQuestions ?? 0,
+                correctAnswers: it.correctAnswers ?? 0,
+                earnedXP: it.earnedXP ?? 0,
+                status: it.status,
+                createdAt: it.createdAt,
+                finishedAt: it.finishedAt ?? null,
+            }));
+
+            return res.json({ page: p, pageSize: ps, total, totalPages, items: mapped });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
 
-
     /**
-     * GET /quiz-attempts/:attemptId/review - user only
-     * Trả attempt summary + câu hỏi + đáp án user + đáp án đúng
+     * GET /quiz-attempts/:attemptId/review
      */
     async review(req, res) {
         try {
@@ -721,7 +1240,6 @@ module.exports = {
             const attempt = await QuizAttempt.findById(attemptId).lean();
             if (!attempt) return res.status(404).json({ message: "Attempt không tồn tại." });
 
-            // ✅ cho cả user & guest: chỉ cần owner
             if (!isOwnerAttempt(attempt, req)) {
                 return res.status(403).json({ message: "Không có quyền." });
             }
@@ -734,7 +1252,9 @@ module.exports = {
                 questionId: { $in: qIds },
                 deletedAt: null,
                 isActive: true,
-            }).lean();
+            })
+                .select("_id questionId content isCorrect")
+                .lean();
 
             const optByQ = new Map();
             for (const o of options) {
@@ -755,49 +1275,42 @@ module.exports = {
                 wordById = new Map(words.map((w) => [String(w._id), w]));
             }
 
-            const items = questions.map((q) => {
+            const qById = new Map(questions.map((q) => [String(q._id), q]));
+            const orderedQuestions = attempt.questionIds.map((id) => qById.get(String(id))).filter(Boolean);
+
+            const items = orderedQuestions.map((q) => {
                 const a = ansByQ.get(String(q._id)) || null;
                 return {
                     question: {
-                        _id: q._id,
+                        questionId: q._id,
                         content: q.content,
                         questionType: q.questionType,
-                        wordId: q.wordId,
-                        word: includeWordInfo ? wordById.get(String(q.wordId)) || null : undefined,
+                        wordId: q.wordId ?? null,
+                        word: includeWordInfo ? pickWordInfo(wordById.get(String(q.wordId)) || null) : null,
                     },
                     options: optByQ.get(String(q._id)) || [],
                     userAnswer: a
                         ? {
-                            selectedOptionId: a.selectedOptionId,
-                            answerText: a.answerText,
-                            isCorrect: a.isCorrect,
-                            answeredAt: a.answeredAt,
+                            selectedOptionId: a.selectedOptionId ?? null,
+                            answerText: a.answerText ?? null,
+                            isCorrect: a.isCorrect ?? null,
+                            answeredAt: a.answeredAt ?? null,
                         }
                         : null,
                 };
             });
 
             return res.json({
-                attempt: {
-                    _id: attempt._id,
-                    mode: attempt.mode,
-                    topicId: attempt.topicId,
-                    level: attempt.level,
-                    totalQuestions: attempt.totalQuestions,
-                    correctAnswers: attempt.correctAnswers,
-                    earnedXP: attempt.earnedXP,
-                    status: attempt.status,
-                    createdAt: attempt.createdAt,
-                },
+                attempt: attemptDto(attempt),
                 items,
             });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
+
     /**
      * POST /quiz-attempts/:attemptId/abandon
-     * user or guest (ownership required)
      */
     async abandon(req, res) {
         try {
@@ -808,16 +1321,16 @@ module.exports = {
 
             if (!isOwnerAttempt(attempt, req)) return res.status(403).json({ message: "Không có quyền." });
 
-            if (attempt.status !== "IN_PROGRESS") return res.status(400).json({ message: "Attempt đã kết thúc/bỏ." });
+            if (attempt.status !== "IN_PROGRESS") {
+                return res.status(400).json({ message: "Attempt đã kết thúc/bỏ." });
+            }
 
             attempt.status = "ABANDONED";
             await attempt.save();
 
-            return res.json({ message: "Đã bỏ quiz.", attemptId: attempt._id });
+            return res.json({ message: "Đã bỏ quiz.", attemptId: attempt._id, status: attempt.status });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
-
-
 };

@@ -1,35 +1,79 @@
 const express = require("express");
 const router = express.Router();
 
-const authMiddleware = require("../middlewares/authMiddleware"); // JWT required :contentReference[oaicite:2]{index=2}
+const authMiddleware = require("../middlewares/authMiddleware"); // JWT required
 const optionalAuth = require("../middlewares/optionalAuth");
+
+// ✅ đổi sang controller mới (file bạn vừa xuất)
 const c = require("../controllers/quiz");
 
-// Lấy danh sách quiz theo từng topic (pagination)
-router.get("/quizzes/topics", c.quizzesByTopicsPaginated);
+// ========== QUIZZES (list) ==========
+/**
+ * GET /quiz/quizzes?page=&pageSize=
+ */
+router.get("/quizzes", c.quizzesByTopicsPaginated);
 
-// Start quiz: user (JWT) hoặc guest (x-guest-key)
-router.post("/quiz-attempts", optionalAuth, c.start);
+// ========== ATTEMPTS ==========
+/**
+ * POST /quiz/attempts
+ * Start quiz: user (JWT) hoặc guest (x-guest-key)
+ */
+router.post("/attempts", optionalAuth, c.start);
 
-// Resume attempt: user/guest
-router.get("/quiz-attempts/:attemptId", optionalAuth, c.getAttempt);
+/**
+ * GET /quiz/attempts/:attemptId/questions/:cursor
+ * Get 1 question by cursor (1 câu 1 màn)
+ */
+router.get("/attempts/:attemptId/questions/:cursor", optionalAuth, c.getQuestionByCursor);
 
-// Next batch: chỉ user + INFINITE
-router.post("/quiz-attempts/:attemptId/next-batch", authMiddleware, c.nextBatch);
+/**
+ * POST /quiz/attempts/:attemptId/submit
+ * Submit current answer + trả luôn đúng/sai + câu kế tiếp
+ * (INFINITE: auto next-batch)
+ */
+router.post("/attempts/:attemptId/submit", optionalAuth, c.submitAndNext);
 
-// Update answer: user/guest (ownership check trong controller)
+/**
+ * GET /quiz/attempts/:attemptId?page=&pageSize=
+ * Resume attempt: user/guest (paged questions) - compatibility
+ */
+router.get("/attempts/:attemptId", optionalAuth, c.getAttempt);
+
+/**
+ * POST /quiz/attempts/:attemptId/next-batch
+ * Next batch: chỉ user + INFINITE (compatibility)
+ */
+router.post("/attempts/:attemptId/next-batch", authMiddleware, c.nextBatch);
+
+/**
+ * POST /quiz/attempts/:attemptId/finish
+ * Finish: user/guest
+ */
+router.post("/attempts/:attemptId/finish", optionalAuth, c.finish);
+
+/**
+ * GET /quiz/attempts?mode=&topicId=&from=&to=&page=&pageSize=
+ * History: user only
+ */
+router.get("/attempts", authMiddleware, c.history);
+
+/**
+ * GET /quiz/attempts/:attemptId/review
+ * Review: user/guest
+ */
+router.get("/attempts/:attemptId/review", optionalAuth, c.review);
+
+/**
+ * POST /quiz/attempts/:attemptId/abandon
+ * Abandon: user/guest
+ */
+router.post("/attempts/:attemptId/abandon", optionalAuth, c.abandon);
+
+// ========== ANSWERS ==========
+/**
+ * PUT /quiz/attempt-answers/:attemptAnswerId
+ * Update answer: user/guest (ownership check trong controller)
+ */
 router.put("/attempt-answers/:attemptAnswerId", optionalAuth, c.updateAnswer);
-
-// Finish: user/guest (user => update SR + XP, guest => chỉ tổng kết)
-router.post("/quiz-attempts/:attemptId/finish", optionalAuth, c.finish);
-
-// History: user only
-router.get("/quiz-attempts", authMiddleware, c.history);
-
-// Review
-router.get("/quiz-attempts/:attemptId/review", optionalAuth, c.review);
-
-// Abandon: user/guest
-router.post("/quiz-attempts/:attemptId/abandon", optionalAuth, c.abandon);
 
 module.exports = router;
