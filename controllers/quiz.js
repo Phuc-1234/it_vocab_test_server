@@ -249,30 +249,50 @@ module.exports = {
             const { mode, topicId, level, totalQuestions } = req.body || {};
             const m = String(mode || "").toUpperCase();
 
-            if (!MODES.includes(m)) return res.status(400).json({ message: "mode không hợp lệ." });
+            if (!MODES.includes(m)) {
+                return res.status(400).json({ message: "mode không hợp lệ." });
+            }
 
             const isUser = !!req.user?.userId;
             const guestKey = getGuestKey(req);
 
-            // guest rules
+            // ===== guest rules =====
             if (!isUser) {
                 if (!guestKey) return res.status(401).json({ message: "Guest cần x-guest-key." });
+
                 if (!["RANDOM", "TOPIC"].includes(m)) {
                     return res.status(403).json({ message: "Guest chỉ được RANDOM hoặc TOPIC." });
                 }
+
                 if (m === "TOPIC" && Number(level) !== 1) {
                     return res.status(403).json({ message: "Guest TOPIC chỉ được level 1." });
                 }
             }
 
-            // user rules: LEARN/INFINITE yêu cầu token (đúng theo spec bạn nói)
+            // ===== user rules =====
             if ((m === "LEARN" || m === "INFINITE") && !isUser) {
                 return res.status(401).json({ message: "Chế độ này yêu cầu đăng nhập." });
             }
 
+            // ✅ ===== block if already has IN_PROGRESS attempt =====
+            const inProgressFilter = isUser
+                ? { userId: req.user.userId, status: "IN_PROGRESS" }
+                : { guestKey, status: "IN_PROGRESS" };
+
+            const existing = await QuizAttempt.findOne(inProgressFilter)
+                .select("_id mode topicId level startedAt createdAt")
+                .lean();
+
+            if (existing) {
+                return res.status(409).json({
+                    message: "Bạn đang có một quiz đang làm dở. Vui lòng hoàn thành hoặc bỏ quiz hiện tại trước khi bắt đầu quiz mới.",
+                    inProgressAttempt: existing,
+                });
+            }
+
             const n = Math.max(1, Math.min(Number(totalQuestions || 10), 50));
 
-            // ===== pick questionIds =====
+            // ===== pick questions =====
             let questions = [];
 
             if (m === "RANDOM") {
@@ -283,7 +303,6 @@ module.exports = {
             }
 
             if (m === "INFINITE") {
-                // batch đầu: lấy theo _id tăng dần (stable)
                 questions = await Question.find({ isActive: true, deletedAt: null })
                     .sort({ _id: 1 })
                     .limit(n)
@@ -291,7 +310,9 @@ module.exports = {
             }
 
             if (m === "TOPIC" || m === "LEARN") {
-                if (!topicId || level == null) return res.status(400).json({ message: "Thiếu topicId/level." });
+                if (!topicId || level == null) {
+                    return res.status(400).json({ message: "Thiếu topicId/level." });
+                }
 
                 const wordIds = await getTopicWordIdsBySR({
                     topicId,
@@ -301,32 +322,25 @@ module.exports = {
                     limit: n,
                 });
 
-                // mỗi word lấy 1 question
                 questions = await pickOneQuestionPerWord(wordIds);
 
-                // nếu thiếu câu (word thiếu question), fallback random trong topic
+                // nếu thiếu câu (word thiếu question), fallback random
                 if (questions.length < n) {
                     const missing = n - questions.length;
                     const extra = await Question.aggregate([
-                        {
-                            $match: {
-                                isActive: true,
-                                deletedAt: null,
-                            },
-                        },
+                        { $match: { isActive: true, deletedAt: null } },
                         { $sample: { size: missing } },
                     ]);
                     questions = [...questions, ...extra];
                 }
             }
 
-            if (!questions.length) return res.status(404).json({ message: "Không tìm thấy câu hỏi." });
+            if (!questions.length) {
+                return res.status(404).json({ message: "Không tìm thấy câu hỏi." });
+            }
 
             const questionIds = questions.map((q) => q._id);
 
-            console.log("[START] passed guest check");
-
-            console.log("[START] before QuizAttempt.create");
             // ===== create attempt =====
             const attempt = await QuizAttempt.create({
                 userId: isUser ? req.user.userId : null,
@@ -346,10 +360,7 @@ module.exports = {
                 startedAt: new Date(),
             });
 
-            console.log("[START] after QuizAttempt.create", attempt?._id);
-
-            console.log("[START] before AttemptAnswer.insertMany", questionIds.length);
-            // create AttemptAnswer skeletons
+            // ===== create AttemptAnswer skeletons =====
             await AttemptAnswer.insertMany(
                 questionIds.map((qid) => ({
                     attemptId: attempt._id,
@@ -361,8 +372,6 @@ module.exports = {
                 })),
                 { ordered: false }
             );
-
-            console.log("[START] after AttemptAnswer.insertMany");
 
             const includeWordInfo = m === "LEARN";
             const questionsFull = await buildQuestionsResponse(
