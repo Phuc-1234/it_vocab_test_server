@@ -243,19 +243,28 @@ module.exports = {
                 idToken,
                 audience: process.env.GOOGLE_CLIENT_ID,
             });
-            const data = ticket.getPayload(); // { sub, email, name, picture ... }
+
+            const data = ticket.getPayload();
             const googleId = data.sub;
             const email = (data.email || "").toLowerCase();
 
             if (!email) return res.status(400).json({ message: "Google token không có email." });
 
+            // 1) Ưu tiên tìm theo googleId
             let user = await User.findOne({ googleId });
+
+            // 2) Nếu chưa có thì tìm theo email để link account
             if (!user) {
-                // nếu đã có email => link
                 user = await User.findOne({ email });
+
                 if (user) {
-                    user.googleId = googleId;
+                    user.googleId = googleId; // link
+                    // nếu muốn update avatar/name khi lần đầu link:
+                    if (!user.name && data.name) user.name = data.name;
+                    if (!user.avatarURL && data.picture) user.avatarURL = data.picture;
+                    if (user.isVerifiedMail === false) user.isVerifiedMail = true;
                 } else {
+                    // 3) Tạo mới: CHỈ set field cần thiết (không set facebookId/passwordHash)
                     user = new User({
                         email,
                         name: data.name || null,
@@ -264,7 +273,6 @@ module.exports = {
                         isVerifiedMail: true,
                         role: "USER",
                         status: "ACTIVE",
-                        passwordHash: null,
                     });
                 }
             }
@@ -286,35 +294,43 @@ module.exports = {
             const { accessToken } = req.body || {};
             if (!accessToken) return res.status(400).json({ message: "Thiếu accessToken." });
 
-            // Graph API: /me?fields=id,name,email,picture
             const resp = await axios.get("https://graph.facebook.com/me", {
                 params: { fields: "id,name,email,picture", access_token: accessToken },
             });
+
             const fb = resp.data;
             const facebookId = fb.id;
             const email = (fb.email || "").toLowerCase();
 
             if (!facebookId) return res.status(400).json({ message: "Facebook token không hợp lệ." });
 
+            // 1) Tìm theo facebookId
             let user = await User.findOne({ facebookId });
-            if (!user) {
-                if (email) {
-                    user = await User.findOne({ email });
-                }
+
+            // 2) Nếu chưa có, thử link theo email (nếu FB trả email)
+            if (!user && email) {
+                user = await User.findOne({ email });
                 if (user) {
-                    user.facebookId = facebookId;
-                } else {
-                    user = new User({
-                        email: email || `fb_${facebookId}@noemail.local`,
-                        name: fb.name || null,
-                        avatarURL: fb.picture?.data?.url || null,
-                        facebookId,
-                        isVerifiedMail: Boolean(email),
-                        role: "USER",
-                        status: "ACTIVE",
-                        passwordHash: null,
-                    });
+                    user.facebookId = facebookId; // link
+                    if (!user.name && fb.name) user.name = fb.name;
+                    const picUrl = fb.picture?.data?.url;
+                    if (!user.avatarURL && picUrl) user.avatarURL = picUrl;
+                    if (user.isVerifiedMail === false) user.isVerifiedMail = true;
                 }
+            }
+
+            // 3) Tạo mới nếu vẫn chưa có
+            if (!user) {
+                const picUrl = fb.picture?.data?.url;
+                user = new User({
+                    email: email || `fb_${facebookId}@noemail.local`,
+                    name: fb.name || null,
+                    avatarURL: picUrl || null,
+                    facebookId,
+                    isVerifiedMail: Boolean(email),
+                    role: "USER",
+                    status: "ACTIVE",
+                });
             }
 
             const st = ensureActive(user);
@@ -326,5 +342,5 @@ module.exports = {
         } catch (e) {
             return res.status(401).json({ message: "Facebook login thất bại.", error: e.message });
         }
-    },
+    }
 };

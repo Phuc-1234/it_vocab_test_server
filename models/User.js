@@ -26,8 +26,8 @@ const UserSchema = new mongoose.Schema(
         actionCodeExpiredAt: { type: Date, default: null },
         actionPurpose: { type: String, default: null }, // signup/reset_password
 
-        googleId: { type: String, unique: true, sparse: true, default: null },
-        facebookId: { type: String, unique: true, sparse: true, default: null },
+        googleId: { type: String, unique: true, sparse: true },
+        facebookId: { type: String, unique: true, sparse: true },
 
         // cooldown gửi OTP
         otpLastSentAt: { type: Date, default: null },
