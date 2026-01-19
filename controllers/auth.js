@@ -13,6 +13,10 @@ const {
     verifyResetToken,
 } = require("../utils/jwt");
 const { sendOtpMail } = require("../services/mail");
+const GOOGLE_CLIENT_IDS = (process.env.GOOGLE_CLIENT_IDS || process.env.GOOGLE_CLIENT_ID || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 
@@ -241,30 +245,23 @@ module.exports = {
 
             const ticket = await googleClient.verifyIdToken({
                 idToken,
-                audience: process.env.GOOGLE_CLIENT_ID,
+                audience: GOOGLE_CLIENT_IDS.length ? GOOGLE_CLIENT_IDS : process.env.GOOGLE_CLIENT_ID,
             });
 
             const data = ticket.getPayload();
             const googleId = data.sub;
             const email = (data.email || "").toLowerCase();
-
             if (!email) return res.status(400).json({ message: "Google token không có email." });
 
-            // 1) Ưu tiên tìm theo googleId
             let user = await User.findOne({ googleId });
-
-            // 2) Nếu chưa có thì tìm theo email để link account
             if (!user) {
                 user = await User.findOne({ email });
-
                 if (user) {
-                    user.googleId = googleId; // link
-                    // nếu muốn update avatar/name khi lần đầu link:
+                    user.googleId = googleId;
                     if (!user.name && data.name) user.name = data.name;
                     if (!user.avatarURL && data.picture) user.avatarURL = data.picture;
                     if (user.isVerifiedMail === false) user.isVerifiedMail = true;
                 } else {
-                    // 3) Tạo mới: CHỈ set field cần thiết (không set facebookId/passwordHash)
                     user = new User({
                         email,
                         name: data.name || null,
@@ -294,13 +291,43 @@ module.exports = {
             const { accessToken } = req.body || {};
             if (!accessToken) return res.status(400).json({ message: "Thiếu accessToken." });
 
+            // ✅ (Recommended) verify token via debug_token
+            // Requires app_id + app_secret
+            const appId = process.env.FACEBOOK_APP_ID;
+            const appSecret = process.env.FACEBOOK_APP_SECRET;
+
+            if (appId && appSecret) {
+                const appAccessToken = `${appId}|${appSecret}`;
+                const debugResp = await axios.get("https://graph.facebook.com/debug_token", {
+                    params: {
+                        input_token: accessToken,
+                        access_token: appAccessToken,
+                    },
+                });
+
+                const debugData = debugResp?.data?.data;
+                if (!debugData?.is_valid) {
+                    return res.status(401).json({ message: "Facebook token không hợp lệ." });
+                }
+                // optional: ensure token is for your app
+                if (String(debugData.app_id) !== String(appId)) {
+                    return res.status(401).json({ message: "Facebook token không thuộc ứng dụng này." });
+                }
+            }
+
+            // ✅ Get profile
             const resp = await axios.get("https://graph.facebook.com/me", {
-                params: { fields: "id,name,email,picture", access_token: accessToken },
+                params: {
+                    fields: "id,name,email,picture.type(large)",
+                    access_token: accessToken,
+                },
+                timeout: 10000,
             });
 
-            const fb = resp.data;
+            const fb = resp.data || {};
             const facebookId = fb.id;
-            const email = (fb.email || "").toLowerCase();
+            const email = String(fb.email || "").toLowerCase();
+            const picUrl = fb.picture?.data?.url || null;
 
             if (!facebookId) return res.status(400).json({ message: "Facebook token không hợp lệ." });
 
@@ -313,7 +340,6 @@ module.exports = {
                 if (user) {
                     user.facebookId = facebookId; // link
                     if (!user.name && fb.name) user.name = fb.name;
-                    const picUrl = fb.picture?.data?.url;
                     if (!user.avatarURL && picUrl) user.avatarURL = picUrl;
                     if (user.isVerifiedMail === false) user.isVerifiedMail = true;
                 }
@@ -321,7 +347,6 @@ module.exports = {
 
             // 3) Tạo mới nếu vẫn chưa có
             if (!user) {
-                const picUrl = fb.picture?.data?.url;
                 user = new User({
                     email: email || `fb_${facebookId}@noemail.local`,
                     name: fb.name || null,
@@ -340,7 +365,11 @@ module.exports = {
             const tokens = await issueTokensAndRotateRefresh(user);
             return res.json(tokens);
         } catch (e) {
-            return res.status(401).json({ message: "Facebook login thất bại.", error: e.message });
+            // ✅ axios errors show clearer message
+            const status = e?.response?.status;
+            const fbMsg = e?.response?.data?.error?.message;
+            const msg = fbMsg || e?.message || "Facebook login thất bại.";
+            return res.status(401).json({ message: "Facebook login thất bại.", error: msg, status });
         }
     }
 };

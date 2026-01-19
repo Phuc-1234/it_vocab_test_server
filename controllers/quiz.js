@@ -147,6 +147,7 @@ async function pickOneQuestionPerWord(wordIds) {
 }
 
 async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10 }) {
+    // Guest: không có SR -> lấy word theo topicId + level (thứ tự mặc định)
     if (isGuest) {
         const words = await Word.find({
             topicId,
@@ -160,7 +161,9 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
         return words.map((w) => String(w._id));
     }
 
-    const now = new Date();
+    // User: SR -> ưu tiên nextReviewDate sớm nhất
+    // Word chưa có progress: nextReviewDate = 1950-01-01 để được ưu tiên đầu tiên (theo nghiệp vụ hình)
+    const NEW_DATE = new Date("1950-01-01T00:00:00.000Z");
 
     const rows = await Word.aggregate([
         {
@@ -186,6 +189,9 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
                             },
                         },
                     },
+                    // chỉ cần 1 progress
+                    { $limit: 1 },
+                    { $project: { _id: 0, nextReviewDate: 1, studyLevel: 1 } },
                 ],
                 as: "p",
             },
@@ -193,7 +199,7 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
         { $addFields: { p: { $arrayElemAt: ["$p", 0] } } },
         {
             $addFields: {
-                nextReviewDateSort: { $ifNull: ["$p.nextReviewDate", now] },
+                nextReviewDateSort: { $ifNull: ["$p.nextReviewDate", NEW_DATE] },
                 studyLevelSort: { $ifNull: ["$p.studyLevel", 0] },
             },
         },
@@ -422,6 +428,10 @@ module.exports = {
      * POST /quiz-attempts
      * Flow "1 câu 1 màn": trả về cursor=0 + question đầu tiên
      */
+    /**
+     * POST /quiz/attempts
+     * Flow "1 câu 1 màn": trả về cursor=0 + question đầu tiên
+     */
     async start(req, res) {
         try {
             const { mode, topicId, level, totalQuestions } = req.body || {};
@@ -467,15 +477,15 @@ module.exports = {
                 });
             }
 
-            // INFINITE always 10
+            // số câu
             const n =
                 m === "INFINITE"
                     ? INFINITE_BATCH_SIZE
                     : Math.max(1, Math.min(Number(totalQuestions || 10), 50));
 
-            // pick questions
             let questions = [];
 
+            // RANDOM: random câu hỏi
             if (m === "RANDOM") {
                 questions = await Question.aggregate([
                     { $match: { isActive: true, deletedAt: null } },
@@ -483,13 +493,15 @@ module.exports = {
                 ]);
             }
 
+            // INFINITE: theo nghiệp vụ hình => cũng random (không SR)
             if (m === "INFINITE") {
-                questions = await Question.find({ isActive: true, deletedAt: null })
-                    .sort({ _id: 1 })
-                    .limit(n)
-                    .lean();
+                questions = await Question.aggregate([
+                    { $match: { isActive: true, deletedAt: null } },
+                    { $sample: { size: n } },
+                ]);
             }
 
+            // TOPIC/LEARN: lấy word theo NextReviewDate sớm nhất rồi pick 1 question/word
             if (m === "TOPIC" || m === "LEARN") {
                 if (!topicId || level == null) {
                     return res.status(400).json({ message: "Thiếu topicId/level." });
@@ -505,6 +517,7 @@ module.exports = {
 
                 questions = await pickOneQuestionPerWord(wordIds);
 
+                // thiếu câu thì bù random cho đủ n
                 if (questions.length < n) {
                     const missing = n - questions.length;
                     const extra = await Question.aggregate([
@@ -1081,6 +1094,10 @@ module.exports = {
     /**
      * POST /quiz-attempts/:attemptId/finish
      */
+    /**
+     * POST /quiz/attempts/:attemptId/finish
+     * SR update: chỉ user + TOPIC (theo hình)
+     */
     async finish(req, res) {
         try {
             const { attemptId } = req.params;
@@ -1089,7 +1106,6 @@ module.exports = {
             if (!attempt) return res.status(404).json({ message: "Attempt không tồn tại." });
 
             if (!isOwnerAttempt(attempt, req)) return res.status(403).json({ message: "Không có quyền." });
-
             if (attempt.status !== "IN_PROGRESS") return res.status(400).json({ message: "Attempt đã kết thúc/bỏ." });
 
             const answers = await AttemptAnswer.find({ attemptId: attempt._id }).lean();
@@ -1110,53 +1126,65 @@ module.exports = {
             attempt.finishedAt = new Date();
             await attempt.save();
 
-            // SR update only for user + TOPIC
+            // ==========================
+            // SR update only for user + TOPIC (theo hình)
+            // ==========================
             if (isUser && attempt.mode === "TOPIC") {
                 const now = new Date();
+                const NEW_DATE = new Date("1950-01-01T00:00:00.000Z");
+                const DAY_MS = 24 * 60 * 60 * 1000;
 
+                // map questionId -> wordId
                 const questions = await Question.find({ _id: { $in: attempt.questionIds } })
                     .select("_id wordId")
                     .lean();
+
                 const qToWord = new Map(questions.map((q) => [String(q._id), String(q.wordId)]));
 
+                // aggregate per word: đúng/sai (nếu 1 word có nhiều câu thì sai ưu tiên)
                 const wordAgg = new Map();
                 for (const a of answers) {
                     const wid = qToWord.get(String(a.questionId));
                     if (!wid) continue;
+
                     if (!wordAgg.has(wid)) wordAgg.set(wid, { anyWrong: false, anyCorrect: false });
-                    const w = wordAgg.get(wid);
-                    if (a.isCorrect === false) w.anyWrong = true;
-                    if (a.isCorrect === true) w.anyCorrect = true;
+
+                    const st = wordAgg.get(wid);
+                    if (a.isCorrect === false) st.anyWrong = true;
+                    if (a.isCorrect === true) st.anyCorrect = true;
                 }
 
                 for (const [wordId, st] of wordAgg.entries()) {
                     let p = await UserWordProgress.findOne({ userId: attempt.userId, wordId });
+
+                    // nếu chưa có progress -> tạo NEW theo hình
                     if (!p) {
                         p = await UserWordProgress.create({
                             userId: attempt.userId,
                             wordId,
                             studyLevel: 0,
-                            nextReviewDate: now,
+                            nextReviewDate: NEW_DATE,
                             lastReviewDate: null,
                             reviewState: "NEW",
                         });
                     }
 
-                    const penalty = calcOverduePenalty(p.nextReviewDate, p.studyLevel, now);
-                    if (penalty > 0) {
-                        p.studyLevel = Math.max(p.studyLevel - penalty, 0);
-                    }
+                    const oldLevel = Number(p.studyLevel || 0);
 
                     if (st.anyWrong) {
-                        p.studyLevel = 0;
-                        p.nextReviewDate = now;
+                        // Làm SAI: studyLevel = floor(old/2); next = now + 0.25 ngày
+                        const newLevel = Math.floor(oldLevel / 2);
+                        p.studyLevel = newLevel;
                         p.lastReviewDate = now;
-                        p.reviewState = "NEW";
+                        p.nextReviewDate = new Date(now.getTime() + 0.25 * DAY_MS);
+                        p.reviewState = "REVIEW";
                     } else if (st.anyCorrect) {
-                        p.studyLevel = Math.max(p.studyLevel, 0) + 1;
-                        const days = daysForLevel(p.studyLevel);
+                        // Làm ĐÚNG: studyLevel += 1; next = now + 0.25 * 2^(studyLevel_mới)
+                        const newLevel = oldLevel + 1;
+                        p.studyLevel = newLevel;
                         p.lastReviewDate = now;
-                        p.nextReviewDate = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+                        const days = 0.25 * Math.pow(2, newLevel);
+                        p.nextReviewDate = new Date(now.getTime() + days * DAY_MS);
                         p.reviewState = "REVIEW";
                     }
 
@@ -1175,7 +1203,6 @@ module.exports = {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
-
     /**
      * GET /quiz-attempts?mode=&topicId=&from=&to=&page=1&pageSize=20
      */
