@@ -17,7 +17,10 @@ const MODES = ["TOPIC", "RANDOM", "INFINITE", "LEARN"];
  * Attempt summary DTO (lightweight for Android FE)
  */
 function attemptDto(attempt) {
-    const total = Array.isArray(attempt.questionIds) ? attempt.questionIds.length : (attempt.totalQuestions || 0);
+    const total = Array.isArray(attempt.questionIds)
+        ? attempt.questionIds.length
+        : attempt.totalQuestions || 0;
+
     return {
         attemptId: attempt._id,
         mode: attempt.mode,
@@ -67,7 +70,46 @@ function calcOverduePenalty(nextReviewDate, studyLevel, now = new Date()) {
  * Return a "thin" word object for LEARN mode.
  * Customize WORD_FIELDS to match your Word schema.
  */
-const WORD_FIELDS = ["_id", "term", "meaning", "word", "definition", "pronunciation", "example", "audioUrl", "imageUrl"];
+const WORD_FIELDS = [
+    "_id",
+    "term",
+    "meaning",
+    "word",
+    "definition",
+    "pronunciation",
+    "example",
+    "audioUrl",
+    "imageUrl",
+];
+
+function buildHintFromWord(w) {
+    if (!w) return "";
+    return String(
+        w.example ||
+        w.meaningEN ||
+        w.meaningVN ||
+        w.definition ||   // fallback nếu sau này có
+        w.meaning ||      // fallback nếu sau này có
+        ""
+    ).trim();
+}
+
+function buildExplanationFromWord(w) {
+    if (!w) return "";
+    return String(
+        w.meaningEN ||
+        w.meaningVN ||
+        w.definition ||
+        w.meaning ||
+        ""
+    ).trim();
+}
+
+function buildExampleFromWord(w) {
+    if (!w) return "";
+    return String(w.example || "").trim();
+}
+
 
 function pickWordInfo(w) {
     if (!w) return null;
@@ -75,9 +117,17 @@ function pickWordInfo(w) {
     for (const k of WORD_FIELDS) {
         if (Object.prototype.hasOwnProperty.call(w, k) && w[k] != null) out[k] = w[k];
     }
-    // always include _id if present
     if (w._id && !out._id) out._id = w._id;
     return Object.keys(out).length ? out : { _id: w._id };
+}
+
+function toObjectIdMaybe(v) {
+    try {
+        if (v == null) return null;
+        return new mongoose.Types.ObjectId(String(v));
+    } catch {
+        return null;
+    }
 }
 
 /**
@@ -85,7 +135,8 @@ function pickWordInfo(w) {
  * {
  *   questionId, content, questionType, wordId,
  *   options: [{_id, content}],
- *   word: null | { ...thin word... }
+ *   word: null | { ...thin word... },
+ *   hint: string
  * }
  */
 async function buildQuestionDtos(questions, includeWordInfo = false) {
@@ -103,44 +154,74 @@ async function buildQuestionDtos(questions, includeWordInfo = false) {
     for (const opt of options) {
         const k = String(opt.questionId);
         if (!optByQ.has(k)) optByQ.set(k, []);
-        optByQ.get(k).push({
-            _id: opt._id,
-            content: opt.content,
-        });
+        optByQ.get(k).push({ _id: opt._id, content: opt.content });
     }
 
+    // ===== Word lookup for LEARN =====
     let wordById = new Map();
     if (includeWordInfo) {
-        const wordIds = [...new Set(questions.map((q) => String(q.wordId)).filter(Boolean))].map(
-            (id) => new mongoose.Types.ObjectId(id)
-        );
-        const words = await Word.find({ _id: { $in: wordIds } }).lean();
-        wordById = new Map(words.map((w) => [String(w._id), w]));
+        const rawIds = [
+            ...new Set(
+                questions
+                    .map((q) => q.wordId)
+                    .filter(Boolean)
+                    .map((id) => String(id))
+            ),
+        ];
+
+        const objIds = rawIds.map(toObjectIdMaybe).filter(Boolean);
+
+        // Robust query: tolerate ObjectId or string _id
+        const words = await Word.find({
+            $or: [
+                { _id: { $in: objIds } },
+                { _id: { $in: rawIds } },
+                // nếu schema có field wordId riêng (optional)
+                { wordId: { $in: rawIds } },
+            ],
+        }).lean();
+
+        wordById = new Map();
+        for (const w of words) {
+            // map by _id
+            wordById.set(String(w._id), w);
+            // map by wordId field if exists
+            if (w.wordId != null) wordById.set(String(w.wordId), w);
+        }
     }
 
-    return questions.map((q) => ({
-        questionId: q._id,
-        content: q.content,
-        questionType: q.questionType,
-        wordId: q.wordId ?? null,
-        options: optByQ.get(String(q._id)) || [],
-        word: includeWordInfo ? pickWordInfo(wordById.get(String(q.wordId)) || null) : null,
-    }));
+    return questions.map((q) => {
+        const w = includeWordInfo ? wordById.get(String(q.wordId)) || null : null;
+
+        return {
+            questionId: q._id,
+            content: q.content,
+            questionType: q.questionType,
+            wordId: q.wordId ?? null,
+            options: optByQ.get(String(q._id)) || [],
+            word: includeWordInfo ? pickWordInfo(w) : null,
+            hint: includeWordInfo ? buildHintFromWord(w) : "",
+        };
+    });
 }
 
 async function pickOneQuestionPerWord(wordIds) {
     const out = [];
     for (const wid of wordIds) {
+        const oid = toObjectIdMaybe(wid);
+        if (!oid) continue;
+
         const q = await Question.aggregate([
             {
                 $match: {
-                    wordId: new mongoose.Types.ObjectId(wid),
+                    wordId: oid,
                     isActive: true,
                     deletedAt: null,
                 },
             },
             { $sample: { size: 1 } },
         ]);
+
         if (q[0]) out.push(q[0]);
     }
     return out;
@@ -158,11 +239,10 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
             .select("_id")
             .limit(limit)
             .lean();
+
         return words.map((w) => String(w._id));
     }
 
-    // User: SR -> ưu tiên nextReviewDate sớm nhất
-    // Word chưa có progress: nextReviewDate = 1950-01-01 để được ưu tiên đầu tiên (theo nghiệp vụ hình)
     const NEW_DATE = new Date("1950-01-01T00:00:00.000Z");
 
     const rows = await Word.aggregate([
@@ -189,7 +269,6 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
                             },
                         },
                     },
-                    // chỉ cần 1 progress
                     { $limit: 1 },
                     { $project: { _id: 0, nextReviewDate: 1, studyLevel: 1 } },
                 ],
@@ -203,7 +282,6 @@ async function getTopicWordIdsBySR({ topicId, level, userId, isGuest, limit = 10
                 studyLevelSort: { $ifNull: ["$p.studyLevel", 0] },
             },
         },
-        // ưu tiên nextReviewDate sớm nhất, rồi studyLevel thấp
         { $sort: { nextReviewDateSort: 1, studyLevelSort: 1, _id: 1 } },
         { $limit: limit },
         { $project: { _id: 1 } },
@@ -255,7 +333,6 @@ async function attachAttemptAnswers({ attemptId, questionsDto }) {
 }
 
 async function ensureInfiniteNextBatchIfNeeded(attempt) {
-    // gọi khi: attempt.mode === INFINITE và cursor next >= attempt.questionIds.length
     const more = await Question.find({
         isActive: true,
         deletedAt: null,
@@ -298,7 +375,6 @@ async function ensureInfiniteNextBatchIfNeeded(attempt) {
 async function gradeAndSaveAttemptAnswer({ aa, question, selectedOptionId, answerText }) {
     let isCorrect = false;
 
-    // extra info for FE (to show correct answer after submit)
     let correctOptionId = null;
     let correctAnswers = null;
 
@@ -425,12 +501,7 @@ module.exports = {
     },
 
     /**
-     * POST /quiz-attempts
-     * Flow "1 câu 1 màn": trả về cursor=0 + question đầu tiên
-     */
-    /**
      * POST /quiz/attempts
-     * Flow "1 câu 1 màn": trả về cursor=0 + question đầu tiên
      */
     async start(req, res) {
         try {
@@ -477,15 +548,10 @@ module.exports = {
                 });
             }
 
-            // số câu
-            const n =
-                m === "INFINITE"
-                    ? INFINITE_BATCH_SIZE
-                    : Math.max(1, Math.min(Number(totalQuestions || 10), 50));
+            const n = m === "INFINITE" ? INFINITE_BATCH_SIZE : Math.max(1, Math.min(Number(totalQuestions || 10), 50));
 
             let questions = [];
 
-            // RANDOM: random câu hỏi
             if (m === "RANDOM") {
                 questions = await Question.aggregate([
                     { $match: { isActive: true, deletedAt: null } },
@@ -493,7 +559,6 @@ module.exports = {
                 ]);
             }
 
-            // INFINITE: theo nghiệp vụ hình => cũng random (không SR)
             if (m === "INFINITE") {
                 questions = await Question.aggregate([
                     { $match: { isActive: true, deletedAt: null } },
@@ -501,7 +566,6 @@ module.exports = {
                 ]);
             }
 
-            // TOPIC/LEARN: lấy word theo NextReviewDate sớm nhất rồi pick 1 question/word
             if (m === "TOPIC" || m === "LEARN") {
                 if (!topicId || level == null) {
                     return res.status(400).json({ message: "Thiếu topicId/level." });
@@ -517,11 +581,11 @@ module.exports = {
 
                 questions = await pickOneQuestionPerWord(wordIds);
 
-                // thiếu câu thì bù random cho đủ n
                 if (questions.length < n) {
                     const missing = n - questions.length;
                     const extra = await Question.aggregate([
-                        { $match: { isActive: true, deletedAt: null } },
+                        // ✅ tránh lấy câu không có wordId (LEARN cần hint/word)
+                        { $match: { isActive: true, deletedAt: null, wordId: { $ne: null } } },
                         { $sample: { size: missing } },
                     ]);
                     questions = [...questions, ...extra];
@@ -534,7 +598,6 @@ module.exports = {
 
             const questionIds = questions.map((q) => q._id);
 
-            // create attempt
             const attempt = await QuizAttempt.create({
                 userId: isUser ? req.user.userId : null,
                 isGuest: !isUser,
@@ -553,7 +616,6 @@ module.exports = {
                 startedAt: new Date(),
             });
 
-            // create AttemptAnswer skeletons
             await AttemptAnswer.insertMany(
                 questionIds.map((qid) => ({
                     attemptId: attempt._id,
@@ -566,7 +628,6 @@ module.exports = {
                 { ordered: false }
             );
 
-            // ===== return ONLY first question (cursor=0) =====
             const firstId = attempt.questionIds[0];
             const firstQ = await Question.findById(firstId).lean();
             if (!firstQ) return res.status(500).json({ message: "Lỗi dữ liệu: thiếu câu đầu tiên." });
@@ -671,7 +732,6 @@ module.exports = {
 
             const qid = attempt.questionIds[idx];
 
-            // load AttemptAnswer
             let aa = null;
             if (attemptAnswerId) {
                 aa = await AttemptAnswer.findById(attemptAnswerId);
@@ -689,8 +749,7 @@ module.exports = {
             if (!question) return res.status(404).json({ message: "Question không tồn tại." });
 
             // =========================================================
-            // ✅ CÁCH 1: Idempotent submit (gọi 2 lần vẫn trả y như lần đầu)
-            // Nếu câu này đã được trả lời rồi -> KHÔNG chấm lại, chỉ trả lại kết quả cũ + next
+            // Idempotent submit: nếu đã trả lời -> trả lại kết quả cũ + next
             // =========================================================
             if (aa.answeredAt) {
                 let correctOptionId = null;
@@ -721,7 +780,6 @@ module.exports = {
                 let nextCursor = idx + 1;
                 let batchAppended = false;
 
-                // nếu next vượt tổng hiện có
                 if (nextCursor >= attempt.questionIds.length) {
                     if (attempt.mode === "INFINITE") {
                         if (!attempt.userId) return res.status(401).json({ message: "Chế độ này yêu cầu đăng nhập." });
@@ -768,7 +826,6 @@ module.exports = {
                     }
                 }
 
-                // load next question
                 const nextQid = attempt.questionIds[nextCursor];
                 const nextQ = await Question.findById(nextQid).lean();
                 if (!nextQ) {
@@ -807,27 +864,20 @@ module.exports = {
                         },
                     },
                     batchAppended,
-                    next: {
-                        cursor: nextCursor,
-                        question: mergedNext,
-                    },
+                    next: { cursor: nextCursor, question: mergedNext },
                     finished: false,
                 });
             }
 
-            // =========================================================
             // Normal flow: grade & save lần đầu
-            // =========================================================
             const graded = await gradeAndSaveAttemptAnswer({ aa, question, selectedOptionId, answerText });
             if (!graded.ok) {
                 return res.status(graded.status).json({ message: graded.message });
             }
 
-            // next cursor
             let nextCursor = idx + 1;
             let batchAppended = false;
 
-            // nếu next vượt tổng hiện có
             if (nextCursor >= attempt.questionIds.length) {
                 if (attempt.mode === "INFINITE") {
                     if (!attempt.userId) return res.status(401).json({ message: "Chế độ này yêu cầu đăng nhập." });
@@ -874,7 +924,6 @@ module.exports = {
                 }
             }
 
-            // load next question
             const nextQid = attempt.questionIds[nextCursor];
             const nextQ = await Question.findById(nextQid).lean();
             if (!nextQ) {
@@ -913,10 +962,7 @@ module.exports = {
                     },
                 },
                 batchAppended,
-                next: {
-                    cursor: nextCursor,
-                    question: mergedNext,
-                },
+                next: { cursor: nextCursor, question: mergedNext },
                 finished: false,
             });
         } catch (e) {
@@ -1092,11 +1138,7 @@ module.exports = {
     },
 
     /**
-     * POST /quiz-attempts/:attemptId/finish
-     */
-    /**
      * POST /quiz/attempts/:attemptId/finish
-     * SR update: chỉ user + TOPIC (theo hình)
      */
     async finish(req, res) {
         try {
@@ -1126,22 +1168,18 @@ module.exports = {
             attempt.finishedAt = new Date();
             await attempt.save();
 
-            // ==========================
-            // SR update only for user + TOPIC (theo hình)
-            // ==========================
+            // SR update only for user + TOPIC
             if (isUser && attempt.mode === "TOPIC") {
                 const now = new Date();
                 const NEW_DATE = new Date("1950-01-01T00:00:00.000Z");
                 const DAY_MS = 24 * 60 * 60 * 1000;
 
-                // map questionId -> wordId
                 const questions = await Question.find({ _id: { $in: attempt.questionIds } })
                     .select("_id wordId")
                     .lean();
 
                 const qToWord = new Map(questions.map((q) => [String(q._id), String(q.wordId)]));
 
-                // aggregate per word: đúng/sai (nếu 1 word có nhiều câu thì sai ưu tiên)
                 const wordAgg = new Map();
                 for (const a of answers) {
                     const wid = qToWord.get(String(a.questionId));
@@ -1157,7 +1195,6 @@ module.exports = {
                 for (const [wordId, st] of wordAgg.entries()) {
                     let p = await UserWordProgress.findOne({ userId: attempt.userId, wordId });
 
-                    // nếu chưa có progress -> tạo NEW theo hình
                     if (!p) {
                         p = await UserWordProgress.create({
                             userId: attempt.userId,
@@ -1172,14 +1209,12 @@ module.exports = {
                     const oldLevel = Number(p.studyLevel || 0);
 
                     if (st.anyWrong) {
-                        // Làm SAI: studyLevel = floor(old/2); next = now + 0.25 ngày
                         const newLevel = Math.floor(oldLevel / 2);
                         p.studyLevel = newLevel;
                         p.lastReviewDate = now;
                         p.nextReviewDate = new Date(now.getTime() + 0.25 * DAY_MS);
                         p.reviewState = "REVIEW";
                     } else if (st.anyCorrect) {
-                        // Làm ĐÚNG: studyLevel += 1; next = now + 0.25 * 2^(studyLevel_mới)
                         const newLevel = oldLevel + 1;
                         p.studyLevel = newLevel;
                         p.lastReviewDate = now;
@@ -1203,6 +1238,7 @@ module.exports = {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
+
     /**
      * GET /quiz-attempts?mode=&topicId=&from=&to=&page=1&pageSize=20
      */
@@ -1292,14 +1328,21 @@ module.exports = {
 
             const ansByQ = new Map(answers.map((a) => [String(a.questionId), a]));
 
-            const includeWordInfo = attempt.mode === "LEARN";
+            const includeWordInfo = true; // ✅ luôn bật
             let wordById = new Map();
-            if (includeWordInfo) {
-                const wordIds = [...new Set(questions.map((q) => String(q.wordId)))].map(
-                    (id) => new mongoose.Types.ObjectId(id)
-                );
-                const words = await Word.find({ _id: { $in: wordIds } }).lean();
-                wordById = new Map(words.map((w) => [String(w._id), w]));
+
+            const rawIds = [...new Set(questions.map((q) => q.wordId).filter(Boolean).map((id) => String(id)))];
+            const objIds = rawIds.map(toObjectIdMaybe).filter(Boolean);
+
+            const words = rawIds.length
+                ? await Word.find({
+                    $or: [{ _id: { $in: objIds } }, { _id: { $in: rawIds } }, { wordId: { $in: rawIds } }],
+                }).lean()
+                : [];
+
+            for (const w of words) {
+                wordById.set(String(w._id), w);
+                if (w.wordId != null) wordById.set(String(w.wordId), w);
             }
 
             const qById = new Map(questions.map((q) => [String(q._id), q]));
@@ -1307,13 +1350,20 @@ module.exports = {
 
             const items = orderedQuestions.map((q) => {
                 const a = ansByQ.get(String(q._id)) || null;
+                const w = includeWordInfo ? wordById.get(String(q.wordId)) || null : null;
+
                 return {
                     question: {
                         questionId: q._id,
                         content: q.content,
                         questionType: q.questionType,
                         wordId: q.wordId ?? null,
-                        word: includeWordInfo ? pickWordInfo(wordById.get(String(q.wordId)) || null) : null,
+                        word: includeWordInfo ? pickWordInfo(w) : null,
+                        hint: includeWordInfo ? buildHintFromWord(w) : "",
+
+                        // ✅ NEW: phục vụ ReviewAnswersView
+                        explanation: includeWordInfo ? buildExplanationFromWord(w) : "",
+                        example: includeWordInfo ? buildExampleFromWord(w) : "",
                     },
                     options: optByQ.get(String(q._id)) || [],
                     userAnswer: a
