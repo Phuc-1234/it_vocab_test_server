@@ -1,13 +1,18 @@
 // src/controllers/profile.controller.js
 const mongoose = require("mongoose");
 
-const User = require("../models/User.model");
-const UserRank = require("../models/UserRank.model");
-const Rank = require("../models/Rank.model");
-const Inventory = require("../models/Inventory.model");
+const User = require("../models/User");
+const UserRank = require("../models/UserRank");
+const Rank = require("../models/Rank");
+const Inventory = require("../models/Inventory");
 
-const { uploadAvatarToCloudinary } = require("../services/cloudinaryUpload.service");
+// ✅ NEW: stats sources
+const QuizAttempt = require("../models/QuizAttempt");
+const UserWordProgress = require("../models/UserWordProgress");
 
+const { uploadAvatarToCloudinary } = require("../services/cloudinaryUpload");
+
+// ===== Normalizers =====
 function normalizeName(name) {
     if (name == null) return undefined; // không update
     if (typeof name !== "string") return null;
@@ -30,17 +35,25 @@ function normalizePhone(phone) {
     return trimmed;
 }
 
-async function computeRankInfo(userId, currentXP) {
+// ===== Rank / Skin helpers =====
+// ✅ INCREMENTAL RANK: neededEXP = ngưỡng XP để lên rank kế tiếp
+// - currentRank lấy theo latest UserRank (fallback rankLevel=1)
+// - nextRank = currentRank.rankLevel + 1
+async function computeRankInfo(userId) {
     const latestUserRank = await UserRank.findOne({ userId })
         .sort({ achievedDate: -1 })
         .populate("rankId")
         .lean();
 
-    const currentRankDoc = latestUserRank?.rankId || null;
+    let currentRankDoc = latestUserRank?.rankId || null;
 
-    const nextRankDoc = await Rank.findOne({ neededEXP: { $gt: currentXP } })
-        .sort({ neededEXP: 1 })
-        .lean();
+    if (!currentRankDoc) {
+        currentRankDoc = await Rank.findOne({ rankLevel: 1 }).lean();
+    }
+
+    const currentLevel = Number(currentRankDoc?.rankLevel || 1);
+
+    const nextRankDoc = await Rank.findOne({ rankLevel: currentLevel + 1 }).lean();
 
     const currentRank = currentRankDoc
         ? {
@@ -56,8 +69,7 @@ async function computeRankInfo(userId, currentXP) {
             rankId: nextRankDoc._id,
             rankLevel: nextRankDoc.rankLevel,
             rankName: nextRankDoc.rankName,
-            neededEXP: nextRankDoc.neededEXP,
-            remainingEXP: Math.max(0, nextRankDoc.neededEXP - currentXP),
+            neededEXP: nextRankDoc.neededEXP, // ✅ ngưỡng để lên rank này
         }
         : null;
 
@@ -65,9 +77,7 @@ async function computeRankInfo(userId, currentXP) {
 }
 
 async function getSkinInfo(userId) {
-    const inv = await Inventory.find({ userId, isActive: true })
-        .populate("itemId")
-        .lean();
+    const inv = await Inventory.find({ userId, isActive: true }).populate("itemId").lean();
 
     const skins = inv
         .filter((x) => x.itemId && x.itemId.itemType === "SKIN")
@@ -84,11 +94,52 @@ async function getSkinInfo(userId) {
 
     // Rule: activeSkin = skin có activatedAt mới nhất
     const activeSkin =
-        skins
-            .filter((s) => s.activatedAt)
-            .sort((a, b) => new Date(b.activatedAt) - new Date(a.activatedAt))[0] || null;
+        skins.filter((s) => s.activatedAt).sort((a, b) => new Date(b.activatedAt) - new Date(a.activatedAt))[0] ||
+        null;
 
     return { skins, activeSkin };
+}
+
+// ===== Stats helpers (cho Profile UI) =====
+async function computeProfileStats(userId) {
+    const uid = new mongoose.Types.ObjectId(String(userId));
+
+    // lessonsDone + accuracy
+    const attemptAgg = await QuizAttempt.aggregate([
+        {
+            $match: {
+                userId: uid,
+                isGuest: false,
+                status: "FINISHED",
+                // tuỳ bạn muốn tính mode nào vào Statistics:
+                // nếu chỉ muốn TOPIC thì đổi $in: ["TOPIC"]
+                mode: { $in: ["TOPIC"] },
+            },
+        },
+        {
+            $group: {
+                _id: null,
+                lessonsDone: { $sum: 1 },
+                totalQuestions: { $sum: { $ifNull: ["$totalQuestions", 0] } },
+                correctAnswers: { $sum: { $ifNull: ["$correctAnswers", 0] } },
+            },
+        },
+    ]);
+
+    const a = attemptAgg[0] || { lessonsDone: 0, totalQuestions: 0, correctAnswers: 0 };
+    const accuracy = a.totalQuestions > 0 ? Math.round((a.correctAnswers / a.totalQuestions) * 100) : 0;
+
+    // wordsLearned (đơn giản: studyLevel > 0)
+    const wordsLearned = await UserWordProgress.countDocuments({
+        userId: uid,
+        studyLevel: { $gt: 0 },
+    });
+
+    return {
+        lessonsDone: a.lessonsDone,
+        wordsLearned,
+        accuracy,
+    };
 }
 
 module.exports = {
@@ -103,9 +154,23 @@ module.exports = {
             const user = await User.findById(userId).lean();
             if (!user) return res.status(404).json({ message: "User không tồn tại." });
 
+            // ✅ INCREMENTAL: currentXP là XP trong rank hiện tại
             const currentXP = user.currentXP ?? 0;
-            const { currentRank, nextRank } = await computeRankInfo(user._id, currentXP);
-            const { skins, activeSkin } = await getSkinInfo(user._id);
+
+            // ✅ chạy song song cho nhanh
+            const [{ currentRank, nextRank }, { skins, activeSkin }, stats] = await Promise.all([
+                computeRankInfo(user._id),
+                getSkinInfo(user._id),
+                computeProfileStats(user._id),
+            ]);
+
+            // ✅ remainingEXP theo incremental threshold
+            const nextRankWithRemain = nextRank
+                ? {
+                    ...nextRank,
+                    remainingEXP: Math.max(0, Number(nextRank.neededEXP || 0) - Number(currentXP || 0)),
+                }
+                : null;
 
             return res.json({
                 message: "Lấy profile thành công.",
@@ -123,11 +188,15 @@ module.exports = {
 
                     // rank
                     currentRank,
-                    nextRank,
+                    nextRank: nextRankWithRemain,
 
                     // skin
                     skins,
                     activeSkin,
+
+                    // ✅ NEW: stats + memberSince cho UI
+                    stats,
+                    memberSince: user.createdAt ?? null,
                 },
             });
         } catch (e) {
@@ -155,8 +224,8 @@ module.exports = {
 
             // chỉ cho sửa name/phone, không nhận email/role/status
             const update = {};
-            if (nextName !== undefined) update.name = nextName;
-            if (nextPhone !== undefined) update.phone = nextPhone;
+            if (nextName !== undefined) update.name = nextName; // null => clear
+            if (nextPhone !== undefined) update.phone = nextPhone; // null => clear
 
             const user = await User.findByIdAndUpdate(userId, update, { new: true, lean: true });
             if (!user) return res.status(404).json({ message: "User không tồn tại." });
@@ -188,22 +257,12 @@ module.exports = {
                 return res.status(400).json({ message: "Thiếu file avatar." });
             }
 
-            // Nếu muốn ép <= 2MB theo spec ảnh:
-            // if (req.file.size > 2 * 1024 * 1024) {
-            //     return res.status(400).json({ message: "File quá lớn (tối đa 2MB)." });
-            // }
-
             const { url } = await uploadAvatarToCloudinary({
                 userId,
                 file: req.file,
             });
 
-            const user = await User.findByIdAndUpdate(
-                userId,
-                { avatarURL: url },
-                { new: true, lean: true }
-            );
-
+            const user = await User.findByIdAndUpdate(userId, { avatarURL: url }, { new: true, lean: true });
             if (!user) return res.status(404).json({ message: "User không tồn tại." });
 
             return res.json({
@@ -214,7 +273,6 @@ module.exports = {
                 },
             });
         } catch (e) {
-            // Có thể bắt lỗi cloudinary rõ hơn nếu cần
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },

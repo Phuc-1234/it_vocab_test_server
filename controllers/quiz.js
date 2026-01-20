@@ -7,7 +7,10 @@ const AnswerOption = require("../models/AnswerOption");
 const Word = require("../models/Word");
 const Topic = require("../models/Topic");
 const UserWordProgress = require("../models/UserWordProgress");
-
+const User = require("../models/User");
+const UserActivity = require("../models/UserActivity");
+const Rank = require("../models/Rank");
+const UserRank = require("../models/UserRank");
 const INFINITE_BATCH_SIZE = 10;
 
 // ===== Helpers =====
@@ -66,6 +69,42 @@ function calcOverduePenalty(nextReviewDate, studyLevel, now = new Date()) {
     return Math.min(studyLevel, overdueDays);
 }
 
+async function computeRankInfo(userId) {
+    const latestUserRank = await UserRank.findOne({ userId })
+        .sort({ achievedDate: -1 })
+        .populate("rankId")
+        .lean();
+
+    // Nếu chưa có rank thì coi như rank 1
+    const currentRankDoc =
+        latestUserRank?.rankId ||
+        (await Rank.findOne({ rankLevel: 1 }).lean());
+
+    const nextRankDoc = currentRankDoc
+        ? await Rank.findOne({ rankLevel: Number(currentRankDoc.rankLevel) + 1 }).lean()
+        : null;
+
+    const currentRank = currentRankDoc
+        ? {
+            rankId: currentRankDoc._id,
+            rankLevel: currentRankDoc.rankLevel,
+            rankName: currentRankDoc.rankName,
+            neededEXP: currentRankDoc.neededEXP,
+        }
+        : null;
+
+    const nextRank = nextRankDoc
+        ? {
+            rankId: nextRankDoc._id,
+            rankLevel: nextRankDoc.rankLevel,
+            rankName: nextRankDoc.rankName,
+            neededEXP: nextRankDoc.neededEXP, // ✅ XP cần để lên rank tiếp theo
+        }
+        : null;
+
+    return { currentRank, nextRank };
+}
+
 /**
  * Return a "thin" word object for LEARN mode.
  * Customize WORD_FIELDS to match your Word schema.
@@ -82,6 +121,46 @@ const WORD_FIELDS = [
     "imageUrl",
 ];
 
+async function computePrevRank(currentRankDoc) {
+    if (!currentRankDoc?.neededEXP) return { neededEXP: 0 };
+
+    const prev = await Rank.findOne({ neededEXP: { $lt: currentRankDoc.neededEXP } })
+        .sort({ neededEXP: -1 })
+        .lean();
+
+    return prev
+        ? {
+            rankId: prev._id,
+            rankLevel: prev.rankLevel,
+            rankName: prev.rankName,
+            neededEXP: prev.neededEXP,
+        }
+        : { neededEXP: 0 };
+}
+
+function buildRankProgress({ currentXP, prevRank, nextRank }) {
+    const startEXP = Number(prevRank?.neededEXP ?? 0);
+    const endEXP = Number(nextRank?.neededEXP ?? startEXP);
+
+    const total = Math.max(1, endEXP - startEXP);
+    const current = Math.max(0, Math.min(total, Number(currentXP) - startEXP)); // ✅ reset về 0 khi lên rank
+    const remaining = Math.max(0, total - current);
+    const percent = Math.max(0, Math.min(100, (current / total) * 100));
+
+    return { startEXP, endEXP, current, total, remaining, percent };
+}
+
+function startOfDay(d) {
+    const x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
+
+function diffDays(a, b) {
+    const ms = startOfDay(a).getTime() - startOfDay(b).getTime();
+    return Math.floor(ms / (24 * 60 * 60 * 1000));
+}
+
 function buildHintFromWord(w) {
     if (!w) return "";
     return String(
@@ -93,6 +172,7 @@ function buildHintFromWord(w) {
         ""
     ).trim();
 }
+
 
 function buildExplanationFromWord(w) {
     if (!w) return "";
@@ -548,7 +628,23 @@ module.exports = {
                 });
             }
 
-            const n = m === "INFINITE" ? INFINITE_BATCH_SIZE : Math.max(1, Math.min(Number(totalQuestions || 10), 50));
+            const n =
+                m === "INFINITE"
+                    ? INFINITE_BATCH_SIZE
+                    : Math.max(1, Math.min(Number(totalQuestions || 10), 50));
+
+            // ===== helper: dedupe by _id (giữ thứ tự) =====
+            const uniqById = (arr) => {
+                const seen = new Set();
+                const out = [];
+                for (const q of arr || []) {
+                    const id = q?._id ? String(q._id) : "";
+                    if (!id || seen.has(id)) continue;
+                    seen.add(id);
+                    out.push(q);
+                }
+                return out;
+            };
 
             let questions = [];
 
@@ -581,16 +677,30 @@ module.exports = {
 
                 questions = await pickOneQuestionPerWord(wordIds);
 
+                // ✅ chặn trùng ngay từ lúc bù extra
+                const existedIds = questions.map((q) => q._id).filter(Boolean);
+
                 if (questions.length < n) {
                     const missing = n - questions.length;
+
                     const extra = await Question.aggregate([
-                        // ✅ tránh lấy câu không có wordId (LEARN cần hint/word)
-                        { $match: { isActive: true, deletedAt: null, wordId: { $ne: null } } },
+                        {
+                            $match: {
+                                isActive: true,
+                                deletedAt: null,
+                                wordId: { $ne: null }, // LEARN cần hint/word
+                                _id: { $nin: existedIds }, // ✅ không lấy lại câu đã có
+                            },
+                        },
                         { $sample: { size: missing } },
                     ]);
+
                     questions = [...questions, ...extra];
                 }
             }
+
+            // ✅ dedupe lần cuối để chắc chắn không có _id trùng
+            questions = uniqById(questions);
 
             if (!questions.length) {
                 return res.status(404).json({ message: "Không tìm thấy câu hỏi." });
@@ -616,17 +726,23 @@ module.exports = {
                 startedAt: new Date(),
             });
 
-            await AttemptAnswer.insertMany(
-                questionIds.map((qid) => ({
-                    attemptId: attempt._id,
-                    questionId: qid,
-                    answeredAt: null,
-                    selectedOptionId: null,
-                    answerText: null,
-                    isCorrect: null,
-                })),
-                { ordered: false }
-            );
+            // ✅ insertMany: chịu lỗi duplicate (nếu race condition hoặc index)
+            try {
+                await AttemptAnswer.insertMany(
+                    questionIds.map((qid) => ({
+                        attemptId: attempt._id,
+                        questionId: qid,
+                        answeredAt: null,
+                        selectedOptionId: null,
+                        answerText: null,
+                        isCorrect: null,
+                    })),
+                    { ordered: false }
+                );
+            } catch (err) {
+                if (err?.code !== 11000) throw err;
+                // ignore dup (safe)
+            }
 
             const firstId = attempt.questionIds[0];
             const firstQ = await Question.findById(firstId).lean();
@@ -634,7 +750,10 @@ module.exports = {
 
             const includeWordInfo = attempt.mode === "LEARN";
             const [firstDto] = await buildQuestionDtos([firstQ], includeWordInfo);
-            const [mergedFirst] = await attachAttemptAnswers({ attemptId: attempt._id, questionsDto: [firstDto] });
+            const [mergedFirst] = await attachAttemptAnswers({
+                attemptId: attempt._id,
+                questionsDto: [firstDto],
+            });
 
             const total = attempt.questionIds.length;
             const canNext = total > 1 || attempt.mode === "INFINITE";
@@ -1141,16 +1260,28 @@ module.exports = {
      * POST /quiz/attempts/:attemptId/finish
      */
     async finish(req, res) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
         try {
             const { attemptId } = req.params;
 
-            const attempt = await QuizAttempt.findById(attemptId);
-            if (!attempt) return res.status(404).json({ message: "Attempt không tồn tại." });
+            const attempt = await QuizAttempt.findById(attemptId).session(session);
+            if (!attempt) {
+                await session.abortTransaction();
+                return res.status(404).json({ message: "Attempt không tồn tại." });
+            }
 
-            if (!isOwnerAttempt(attempt, req)) return res.status(403).json({ message: "Không có quyền." });
-            if (attempt.status !== "IN_PROGRESS") return res.status(400).json({ message: "Attempt đã kết thúc/bỏ." });
+            if (!isOwnerAttempt(attempt, req)) {
+                await session.abortTransaction();
+                return res.status(403).json({ message: "Không có quyền." });
+            }
+            if (attempt.status !== "IN_PROGRESS") {
+                await session.abortTransaction();
+                return res.status(400).json({ message: "Attempt đã kết thúc/bỏ." });
+            }
 
-            const answers = await AttemptAnswer.find({ attemptId: attempt._id }).lean();
+            const answers = await AttemptAnswer.find({ attemptId: attempt._id }).session(session).lean();
             const total = attempt.questionIds.length;
             const correct = answers.filter((a) => a.isCorrect === true).length;
 
@@ -1158,17 +1289,16 @@ module.exports = {
             attempt.correctAnswers = correct;
 
             const isUser = !!attempt.userId;
+
             let earnedXP = 0;
-            if (isUser && attempt.mode !== "LEARN") {
-                earnedXP = correct * 5;
-            }
+            if (isUser && attempt.mode !== "LEARN") earnedXP = correct * 5;
             attempt.earnedXP = earnedXP;
 
             attempt.status = "FINISHED";
             attempt.finishedAt = new Date();
-            await attempt.save();
+            await attempt.save({ session });
 
-            // SR update only for user + TOPIC
+            // ===================== UPDATE SR (only user + TOPIC) =====================
             if (isUser && attempt.mode === "TOPIC") {
                 const now = new Date();
                 const NEW_DATE = new Date("1950-01-01T00:00:00.000Z");
@@ -1176,6 +1306,7 @@ module.exports = {
 
                 const questions = await Question.find({ _id: { $in: attempt.questionIds } })
                     .select("_id wordId")
+                    .session(session)
                     .lean();
 
                 const qToWord = new Map(questions.map((q) => [String(q._id), String(q.wordId)]));
@@ -1193,17 +1324,23 @@ module.exports = {
                 }
 
                 for (const [wordId, st] of wordAgg.entries()) {
-                    let p = await UserWordProgress.findOne({ userId: attempt.userId, wordId });
+                    let p = await UserWordProgress.findOne({ userId: attempt.userId, wordId }).session(session);
 
                     if (!p) {
-                        p = await UserWordProgress.create({
-                            userId: attempt.userId,
-                            wordId,
-                            studyLevel: 0,
-                            nextReviewDate: NEW_DATE,
-                            lastReviewDate: null,
-                            reviewState: "NEW",
-                        });
+                        const created = await UserWordProgress.create(
+                            [
+                                {
+                                    userId: attempt.userId,
+                                    wordId,
+                                    studyLevel: 0,
+                                    nextReviewDate: NEW_DATE,
+                                    lastReviewDate: null,
+                                    reviewState: "NEW",
+                                },
+                            ],
+                            { session }
+                        );
+                        p = created[0];
                     }
 
                     const oldLevel = Number(p.studyLevel || 0);
@@ -1223,19 +1360,178 @@ module.exports = {
                         p.reviewState = "REVIEW";
                     }
 
-                    await p.save();
+                    await p.save({ session });
                 }
             }
 
+            // ===================== UPDATE USER XP + STREAK + RANK (mode != LEARN) =====================
+            let userPayload = null;
+            let rankPayload = null;
+            let rankProgress = null;
+
+            if (isUser && attempt.mode !== "LEARN") {
+                const user = await User.findById(attempt.userId).session(session);
+                if (!user) {
+                    await session.abortTransaction();
+                    return res.status(404).json({ message: "User không tồn tại." });
+                }
+
+                const now = new Date();
+                const today = startOfDay(now);
+
+                // 1) XP (incremental per-rank) => cộng vào currentXP
+                user.currentXP = Number(user.currentXP || 0) + Number(earnedXP || 0);
+
+                // 2) STREAK + lastStudyDate
+                if (!user.lastStudyDate) {
+                    user.currentStreak = 1;
+                    user.longestStreak = Math.max(Number(user.longestStreak || 0), user.currentStreak);
+                    user.lastStudyDate = today;
+                } else {
+                    const days = diffDays(today, user.lastStudyDate);
+
+                    if (days === 0) {
+                        user.lastStudyDate = today;
+                    } else if (days === 1) {
+                        user.currentStreak = Number(user.currentStreak || 0) + 1;
+                        user.longestStreak = Math.max(Number(user.longestStreak || 0), user.currentStreak);
+                        user.lastStudyDate = today;
+                    } else if (days > 1) {
+                        user.currentStreak = 1;
+                        user.longestStreak = Math.max(Number(user.longestStreak || 0), user.currentStreak);
+                        user.lastStudyDate = today;
+                    } else {
+                        user.lastStudyDate = today;
+                    }
+                }
+
+                // 3) UserActivity
+                await UserActivity.updateOne(
+                    { userId: user._id, activityDate: today },
+                    { $setOnInsert: { userId: user._id, activityDate: today, wasFrozen: false } },
+                    { upsert: true, session }
+                );
+
+                // 4) Rank-up (INCREMENTAL THRESHOLD) + giữ XP dư + có thể lên nhiều rank
+                //    neededEXP = ngưỡng để lên rank tiếp theo
+                let currentLevel = 1;
+
+                const latestUR = await UserRank.findOne({ userId: user._id })
+                    .sort({ achievedDate: -1 })
+                    .session(session)
+                    .lean();
+
+                if (latestUR?.rankId) {
+                    const curRank = await Rank.findById(latestUR.rankId)
+                        .select("rankLevel")
+                        .session(session)
+                        .lean();
+                    if (curRank?.rankLevel) currentLevel = Number(curRank.rankLevel);
+                }
+
+                // Vòng lặp lên rank liên tiếp nếu đủ XP
+                // Chặn vô hạn: tối đa 100 lần (dư sức)
+                for (let guard = 0; guard < 100; guard++) {
+                    const nextRankDoc = await Rank.findOne({ rankLevel: currentLevel + 1 })
+                        .select("_id rankLevel neededEXP rankName")
+                        .session(session)
+                        .lean();
+
+                    if (!nextRankDoc) break; // hết rank
+
+                    const need = Number(nextRankDoc.neededEXP || 0);
+                    if (need <= 0) break; // dữ liệu rank lỗi
+
+                    if (Number(user.currentXP || 0) < need) break;
+
+                    // ✅ trừ ngưỡng, giữ XP dư
+                    user.currentXP = Number(user.currentXP || 0) - need;
+
+                    // ✅ ghi nhận đạt rank mới
+                    await UserRank.updateOne(
+                        { userId: user._id, rankId: nextRankDoc._id },
+                        { $setOnInsert: { userId: user._id, rankId: nextRankDoc._id, achievedDate: new Date() } },
+                        { upsert: true, session }
+                    );
+
+                    currentLevel = Number(nextRankDoc.rankLevel);
+                }
+
+                await user.save({ session });
+
+                // 5) Rank payload + progress (incremental)
+                // current rank = latest achieved (sau update)
+                const latestAfter = await UserRank.findOne({ userId: user._id })
+                    .sort({ achievedDate: -1 })
+                    .populate("rankId")
+                    .session(session)
+                    .lean();
+
+                const currentRankDoc = latestAfter?.rankId || (await Rank.findOne({ rankLevel: 1 }).session(session).lean());
+                const nextRankDoc = currentRankDoc
+                    ? await Rank.findOne({ rankLevel: Number(currentRankDoc.rankLevel) + 1 }).session(session).lean()
+                    : null;
+
+                const currentRank = currentRankDoc
+                    ? {
+                        rankId: currentRankDoc._id,
+                        rankLevel: currentRankDoc.rankLevel,
+                        rankName: currentRankDoc.rankName,
+                        neededEXP: currentRankDoc.neededEXP,
+                    }
+                    : null;
+
+                const nextRank = nextRankDoc
+                    ? {
+                        rankId: nextRankDoc._id,
+                        rankLevel: nextRankDoc.rankLevel,
+                        rankName: nextRankDoc.rankName,
+                        neededEXP: nextRankDoc.neededEXP, // ✅ ngưỡng để lên rank kế
+                        remainingEXP: Math.max(0, Number(nextRankDoc.neededEXP || 0) - Number(user.currentXP || 0)),
+                    }
+                    : null;
+
+                rankPayload = { currentRank, nextRank };
+
+                const totalNeed = Math.max(1, Number(nextRank?.neededEXP ?? 0));
+                const cur = Math.max(0, Math.min(totalNeed, Number(user.currentXP || 0)));
+
+                rankProgress = {
+                    startEXP: 0,
+                    endEXP: totalNeed,
+                    current: cur,
+                    total: totalNeed,
+                    remaining: Math.max(0, totalNeed - cur),
+                    percent: Math.max(0, Math.min(100, (cur / totalNeed) * 100)),
+                };
+
+                userPayload = {
+                    currentXP: user.currentXP ?? 0,
+                    currentStreak: user.currentStreak ?? 0,
+                    longestStreak: user.longestStreak ?? 0,
+                    lastStudyDate: user.lastStudyDate ?? null,
+                };
+            }
+
+            await session.commitTransaction();
+
             return res.json({
-                attemptId: attempt._id,
-                totalQuestions: attempt.totalQuestions,
-                correctAnswers: attempt.correctAnswers,
-                earnedXP: attempt.earnedXP,
-                status: attempt.status,
+                attempt: {
+                    attemptId: attempt._id,
+                    totalQuestions: attempt.totalQuestions,
+                    correctAnswers: attempt.correctAnswers,
+                    earnedXP: attempt.earnedXP,
+                    status: attempt.status,
+                },
+                ...(userPayload ? { user: userPayload } : {}),
+                ...(rankPayload ? { rank: rankPayload } : {}),
+                ...(rankProgress ? { rankProgress } : {}),
             });
         } catch (e) {
+            await session.abortTransaction();
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
+        } finally {
+            session.endSession();
         }
     },
 

@@ -1,8 +1,14 @@
 // src/controllers/auth.controller.js
 require("dotenv").config();
+
+const mongoose = require("mongoose");
 const axios = require("axios");
 const { OAuth2Client } = require("google-auth-library");
+
 const User = require("../models/User.js");
+const Rank = require("../models/Rank.js");
+const UserRank = require("../models/UserRank.js");
+
 const { sha256, hashPassword, comparePassword } = require("../utils/crypto");
 const { genOtp6 } = require("../utils/otp");
 const {
@@ -13,6 +19,7 @@ const {
     verifyResetToken,
 } = require("../utils/jwt");
 const { sendOtpMail } = require("../services/mail");
+
 const GOOGLE_CLIENT_IDS = (process.env.GOOGLE_CLIENT_IDS || process.env.GOOGLE_CLIENT_ID || "")
     .split(",")
     .map((s) => s.trim())
@@ -23,6 +30,8 @@ const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const OTP_TTL_MIN = Number(process.env.OTP_TTL_MIN || 10);
 const OTP_COOLDOWN_SEC = Number(process.env.OTP_COOLDOWN_SEC || 60);
 
+/* ===================== HELPERS ===================== */
+
 function normalizePurpose(p) {
     const v = String(p || "").toLowerCase();
     return v === "signup" || v === "reset_password" ? v : null;
@@ -30,7 +39,8 @@ function normalizePurpose(p) {
 
 function ensureActive(user) {
     if (!user) return { ok: false, status: 401, message: "Sai thông tin." };
-    if (String(user.status).toUpperCase() === "BANNED") return { ok: false, status: 403, message: "Tài khoản bị khóa." };
+    if (String(user.status).toUpperCase() === "BANNED")
+        return { ok: false, status: 403, message: "Tài khoản bị khóa." };
     return { ok: true };
 }
 
@@ -46,28 +56,111 @@ async function issueTokensAndRotateRefresh(user) {
     return { accessToken, refreshToken };
 }
 
+// so sánh theo ngày (bỏ giờ phút)
+function startOfDay(d) {
+    const x = new Date(d);
+    x.setHours(0, 0, 0, 0);
+    return x;
+}
+
+function diffDays(a, b) {
+    const ms = startOfDay(a).getTime() - startOfDay(b).getTime();
+    return Math.floor(ms / (24 * 60 * 60 * 1000));
+}
+
+/**
+ * Khi login:
+ * - Nếu hôm nay > lastStudyDate + 1 => currentStreak = 0
+ * - KHÔNG update lastStudyDate ở login (lastStudyDate update khi user làm quiz/hoạt động)
+ */
+async function checkStreakOnLogin(user) {
+    if (!user.lastStudyDate) return false;
+
+    const days = diffDays(new Date(), user.lastStudyDate);
+    if (days > 1) {
+        user.currentStreak = 0;
+        await user.save();
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Ensure user có UserRank level 1 (upsert chống trùng)
+ */
+async function ensureUserRankLv1(userId, session) {
+    const q = Rank.findOne({ rankLevel: 1 });
+    if (session) q.session(session);
+    const rankLv1 = await q;
+
+    if (!rankLv1) throw new Error("Thiếu dữ liệu Rank level 1 trong DB.");
+
+    await UserRank.updateOne(
+        { userId, rankId: rankLv1._id },
+        { $setOnInsert: { userId, rankId: rankLv1._id, achievedDate: new Date() } },
+        { upsert: true, ...(session ? { session } : {}) }
+    );
+
+    return rankLv1;
+}
+
+/* ===================== CONTROLLER ===================== */
+
 module.exports = {
     // POST /auth/register
     async register(req, res) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
         try {
             const { name, email, password } = req.body || {};
-            if (!email || !password) return res.status(400).json({ message: "Thiếu email/password." });
+            if (!email || !password) {
+                await session.abortTransaction();
+                return res.status(400).json({ message: "Thiếu email/password." });
+            }
 
-            const existed = await User.findOne({ email });
-            if (existed) return res.status(409).json({ message: "Email đã tồn tại." });
+            const existed = await User.findOne({ email }).session(session);
+            if (existed) {
+                await session.abortTransaction();
+                return res.status(409).json({ message: "Email đã tồn tại." });
+            }
 
-            const user = await User.create({
-                name: name || null,
-                email,
-                passwordHash: await hashPassword(password),
-                isVerifiedMail: false,
-                role: "USER",
-                status: "ACTIVE",
+            // Lưu ý: User schema phải có các field: currentXP/currentStreak/longestStreak/lastStudyDate
+            const userArr = await User.create(
+                [
+                    {
+                        name: name || null,
+                        email,
+                        passwordHash: await hashPassword(password),
+                        isVerifiedMail: false,
+                        role: "USER",
+                        status: "ACTIVE",
+
+                        // ✅ init streak/xp
+                        currentXP: 0,
+                        currentStreak: 0,
+                        longestStreak: 0,
+                        lastStudyDate: null,
+                    },
+                ],
+                { session }
+            );
+
+            const createdUser = userArr[0];
+
+            // ✅ create UserRank level 1
+            await ensureUserRankLv1(createdUser._id, session);
+
+            await session.commitTransaction();
+            return res.status(201).json({
+                userId: String(createdUser._id),
+                message: "Đăng ký thành công.",
             });
-
-            return res.status(201).json({ userId: String(user._id), message: "Đăng ký thành công." });
         } catch (e) {
+            await session.abortTransaction();
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
+        } finally {
+            session.endSession();
         }
     },
 
@@ -81,13 +174,30 @@ module.exports = {
             const st = ensureActive(user);
             if (!st.ok) return res.status(st.status).json({ message: st.message });
 
-            if (!user.passwordHash) return res.status(400).json({ message: "Tài khoản này đăng nhập social, không có mật khẩu." });
+            if (!user.passwordHash) {
+                return res.status(400).json({
+                    message: "Tài khoản này đăng nhập social, không có mật khẩu.",
+                });
+            }
 
             const ok = await comparePassword(password, user.passwordHash);
             if (!ok) return res.status(401).json({ message: "Sai thông tin đăng nhập." });
 
+            // ✅ check streak ngay khi login
+            await checkStreakOnLogin(user);
+
             const tokens = await issueTokensAndRotateRefresh(user);
-            return res.json(tokens);
+
+            return res.json({
+                ...tokens,
+                user: {
+                    userId: String(user._id),
+                    currentXP: user.currentXP ?? 0,
+                    currentStreak: user.currentStreak ?? 0,
+                    longestStreak: user.longestStreak ?? 0,
+                    lastStudyDate: user.lastStudyDate ?? null,
+                },
+            });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
@@ -107,7 +217,9 @@ module.exports = {
             if (user.otpLastSentAt) {
                 const diffSec = (Date.now() - user.otpLastSentAt.getTime()) / 1000;
                 if (diffSec < OTP_COOLDOWN_SEC) {
-                    return res.status(429).json({ message: `Vui lòng thử lại sau ${Math.ceil(OTP_COOLDOWN_SEC - diffSec)}s.` });
+                    return res
+                        .status(429)
+                        .json({ message: `Vui lòng thử lại sau ${Math.ceil(OTP_COOLDOWN_SEC - diffSec)}s.` });
                 }
             }
 
@@ -143,10 +255,9 @@ module.exports = {
 
             if (user.actionPurpose !== p) return res.status(400).json({ message: "Sai mục đích OTP." });
             if (user.actionCodeExpiredAt.getTime() < Date.now()) return res.status(400).json({ message: "OTP đã hết hạn." });
-
             if (sha256(code) !== user.actionCodeHash) return res.status(400).json({ message: "OTP không đúng." });
 
-            // đúng => clear ActionCode*
+            // clear ActionCode*
             user.actionCodeHash = null;
             user.actionCodeExpiredAt = null;
             user.actionPurpose = null;
@@ -173,30 +284,31 @@ module.exports = {
             if (!resetToken || !newPassword) return res.status(400).json({ message: "Thiếu dữ liệu." });
 
             const payload = verifyResetToken(resetToken);
-            if (payload.purpose !== "reset_password") return res.status(401).json({ message: "Reset token không hợp lệ." });
+            if (payload.purpose !== "reset_password")
+                return res.status(401).json({ message: "Reset token không hợp lệ." });
 
             const user = await User.findById(payload.userId);
             if (!user) return res.status(404).json({ message: "User không tồn tại." });
 
             user.passwordHash = await hashPassword(newPassword);
 
-            // khuyến nghị: clear refresh để logout hết
+            // clear refresh để logout hết
             user.refreshTokenHash = null;
-
             await user.save();
+
             return res.json({ message: "Đổi mật khẩu thành công." });
         } catch (e) {
             return res.status(401).json({ message: "Reset token hết hạn/không hợp lệ.", error: e.message });
         }
     },
 
-    // POST /auth/refresh  (JWT required theo spec) { refreshToken }
+    // POST /auth/refresh { refreshToken }
     async refresh(req, res) {
         try {
             const { refreshToken } = req.body || {};
             if (!refreshToken) return res.status(400).json({ message: "Thiếu refreshToken." });
 
-            const payload = verifyRefreshToken(refreshToken); // throws nếu invalid/expired
+            const payload = verifyRefreshToken(refreshToken);
             const user = await User.findById(payload.userId);
             const st = ensureActive(user);
             if (!st.ok) return res.status(st.status).json({ message: st.message });
@@ -219,15 +331,12 @@ module.exports = {
             const { refreshToken } = req.body || {};
             if (!refreshToken) return res.status(400).json({ message: "Thiếu refreshToken." });
 
-            // nếu muốn revoke theo user đang login:
-            // authMiddleware của bạn set req.user = decoded :contentReference[oaicite:2]{index=2}
             const userId = req.user?.userId;
             if (!userId) return res.status(401).json({ message: "Unauthorized." });
 
             const user = await User.findById(userId);
             if (!user) return res.status(404).json({ message: "User không tồn tại." });
 
-            // revoke
             user.refreshTokenHash = null;
             await user.save();
 
@@ -239,9 +348,15 @@ module.exports = {
 
     // POST /auth/google { idToken }
     async google(req, res) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
         try {
             const { idToken } = req.body || {};
-            if (!idToken) return res.status(400).json({ message: "Thiếu idToken." });
+            if (!idToken) {
+                await session.abortTransaction();
+                return res.status(400).json({ message: "Thiếu idToken." });
+            }
 
             const ticket = await googleClient.verifyIdToken({
                 idToken,
@@ -251,17 +366,26 @@ module.exports = {
             const data = ticket.getPayload();
             const googleId = data.sub;
             const email = (data.email || "").toLowerCase();
-            if (!email) return res.status(400).json({ message: "Google token không có email." });
+            if (!email) {
+                await session.abortTransaction();
+                return res.status(400).json({ message: "Google token không có email." });
+            }
 
-            let user = await User.findOne({ googleId });
+            let user = await User.findOne({ googleId }).session(session);
+            let isNewUser = false;
+
             if (!user) {
-                user = await User.findOne({ email });
+                user = await User.findOne({ email }).session(session);
+
                 if (user) {
+                    // link account cũ
                     user.googleId = googleId;
                     if (!user.name && data.name) user.name = data.name;
                     if (!user.avatarURL && data.picture) user.avatarURL = data.picture;
                     if (user.isVerifiedMail === false) user.isVerifiedMail = true;
                 } else {
+                    // tạo mới
+                    isNewUser = true;
                     user = new User({
                         email,
                         name: data.name || null,
@@ -270,52 +394,86 @@ module.exports = {
                         isVerifiedMail: true,
                         role: "USER",
                         status: "ACTIVE",
+
+                        // init streak/xp
+                        currentXP: 0,
+                        currentStreak: 0,
+                        longestStreak: 0,
+                        lastStudyDate: null,
                     });
                 }
             }
 
             const st = ensureActive(user);
-            if (!st.ok) return res.status(st.status).json({ message: st.message });
+            if (!st.ok) {
+                await session.abortTransaction();
+                return res.status(st.status).json({ message: st.message });
+            }
 
-            await user.save();
+            await user.save({ session });
+
+            // ✅ tạo UserRank lv1 nếu tạo mới (upsert an toàn)
+            if (isNewUser) {
+                await ensureUserRankLv1(user._id, session);
+            }
+
+            await session.commitTransaction();
+
+            // ✅ check streak ngay khi login social (nếu muốn áp dụng y hệt login thường)
+            await checkStreakOnLogin(user);
+
             const tokens = await issueTokensAndRotateRefresh(user);
-            return res.json(tokens);
+            return res.json({
+                ...tokens,
+                user: {
+                    userId: String(user._id),
+                    currentXP: user.currentXP ?? 0,
+                    currentStreak: user.currentStreak ?? 0,
+                    longestStreak: user.longestStreak ?? 0,
+                    lastStudyDate: user.lastStudyDate ?? null,
+                },
+            });
         } catch (e) {
+            await session.abortTransaction();
             return res.status(401).json({ message: "Google login thất bại.", error: e.message });
+        } finally {
+            session.endSession();
         }
     },
 
     // POST /auth/facebook { accessToken }
     async facebook(req, res) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
         try {
             const { accessToken } = req.body || {};
-            if (!accessToken) return res.status(400).json({ message: "Thiếu accessToken." });
+            if (!accessToken) {
+                await session.abortTransaction();
+                return res.status(400).json({ message: "Thiếu accessToken." });
+            }
 
-            // ✅ (Recommended) verify token via debug_token
-            // Requires app_id + app_secret
+            // verify token via debug_token (optional)
             const appId = process.env.FACEBOOK_APP_ID;
             const appSecret = process.env.FACEBOOK_APP_SECRET;
 
             if (appId && appSecret) {
                 const appAccessToken = `${appId}|${appSecret}`;
                 const debugResp = await axios.get("https://graph.facebook.com/debug_token", {
-                    params: {
-                        input_token: accessToken,
-                        access_token: appAccessToken,
-                    },
+                    params: { input_token: accessToken, access_token: appAccessToken },
                 });
 
                 const debugData = debugResp?.data?.data;
                 if (!debugData?.is_valid) {
+                    await session.abortTransaction();
                     return res.status(401).json({ message: "Facebook token không hợp lệ." });
                 }
-                // optional: ensure token is for your app
                 if (String(debugData.app_id) !== String(appId)) {
+                    await session.abortTransaction();
                     return res.status(401).json({ message: "Facebook token không thuộc ứng dụng này." });
                 }
             }
 
-            // ✅ Get profile
             const resp = await axios.get("https://graph.facebook.com/me", {
                 params: {
                     fields: "id,name,email,picture.type(large)",
@@ -329,24 +487,28 @@ module.exports = {
             const email = String(fb.email || "").toLowerCase();
             const picUrl = fb.picture?.data?.url || null;
 
-            if (!facebookId) return res.status(400).json({ message: "Facebook token không hợp lệ." });
+            if (!facebookId) {
+                await session.abortTransaction();
+                return res.status(400).json({ message: "Facebook token không hợp lệ." });
+            }
 
-            // 1) Tìm theo facebookId
-            let user = await User.findOne({ facebookId });
+            let user = await User.findOne({ facebookId }).session(session);
+            let isNewUser = false;
 
-            // 2) Nếu chưa có, thử link theo email (nếu FB trả email)
+            // nếu chưa có, thử link theo email
             if (!user && email) {
-                user = await User.findOne({ email });
+                user = await User.findOne({ email }).session(session);
                 if (user) {
-                    user.facebookId = facebookId; // link
+                    user.facebookId = facebookId;
                     if (!user.name && fb.name) user.name = fb.name;
                     if (!user.avatarURL && picUrl) user.avatarURL = picUrl;
                     if (user.isVerifiedMail === false) user.isVerifiedMail = true;
                 }
             }
 
-            // 3) Tạo mới nếu vẫn chưa có
+            // tạo mới nếu vẫn chưa có
             if (!user) {
+                isNewUser = true;
                 user = new User({
                     email: email || `fb_${facebookId}@noemail.local`,
                     name: fb.name || null,
@@ -355,21 +517,52 @@ module.exports = {
                     isVerifiedMail: Boolean(email),
                     role: "USER",
                     status: "ACTIVE",
+
+                    // init streak/xp
+                    currentXP: 0,
+                    currentStreak: 0,
+                    longestStreak: 0,
+                    lastStudyDate: null,
                 });
             }
 
             const st = ensureActive(user);
-            if (!st.ok) return res.status(st.status).json({ message: st.message });
+            if (!st.ok) {
+                await session.abortTransaction();
+                return res.status(st.status).json({ message: st.message });
+            }
 
-            await user.save();
+            await user.save({ session });
+
+            // ✅ tạo UserRank lv1 nếu tạo mới
+            if (isNewUser) {
+                await ensureUserRankLv1(user._id, session);
+            }
+
+            await session.commitTransaction();
+
+            // ✅ check streak ngay khi login social
+            await checkStreakOnLogin(user);
+
             const tokens = await issueTokensAndRotateRefresh(user);
-            return res.json(tokens);
+            return res.json({
+                ...tokens,
+                user: {
+                    userId: String(user._id),
+                    currentXP: user.currentXP ?? 0,
+                    currentStreak: user.currentStreak ?? 0,
+                    longestStreak: user.longestStreak ?? 0,
+                    lastStudyDate: user.lastStudyDate ?? null,
+                },
+            });
         } catch (e) {
-            // ✅ axios errors show clearer message
+            await session.abortTransaction();
             const status = e?.response?.status;
             const fbMsg = e?.response?.data?.error?.message;
             const msg = fbMsg || e?.message || "Facebook login thất bại.";
             return res.status(401).json({ message: "Facebook login thất bại.", error: msg, status });
+        } finally {
+            session.endSession();
         }
-    }
+    },
 };

@@ -3,34 +3,31 @@ const mongoose = require("mongoose");
 
 const UserSchema = new mongoose.Schema(
     {
-        // Mongo đã có _id; bạn có thể dùng _id làm UserID
         name: { type: String, maxlength: 100, default: null },
-
         email: { type: String, required: true, unique: true, lowercase: true, trim: true },
-
         isVerifiedMail: { type: Boolean, required: true, default: false },
-
-        passwordHash: { type: String, default: null }, // null nếu login social
-
+        passwordHash: { type: String, default: null },
         phone: { type: String, maxlength: 30, default: null },
-
         avatarURL: { type: String, default: null },
+        role: { type: String, required: true, default: "USER" },
+        status: { type: String, required: true, default: "ACTIVE" },
 
-        role: { type: String, required: true, default: "USER" }, // USER/ADMIN...
+        refreshTokenHash: { type: String, default: null },
 
-        status: { type: String, required: true, default: "ACTIVE" }, // ACTIVE/BANNED...
-
-        refreshTokenHash: { type: String, default: null }, // rotation
-
-        actionCodeHash: { type: String, default: null }, // OTP hash
+        actionCodeHash: { type: String, default: null },
         actionCodeExpiredAt: { type: Date, default: null },
-        actionPurpose: { type: String, default: null }, // signup/reset_password
+        actionPurpose: { type: String, default: null },
 
         googleId: { type: String, unique: true, sparse: true },
         facebookId: { type: String, unique: true, sparse: true },
 
-        // cooldown gửi OTP
         otpLastSentAt: { type: Date, default: null },
+
+        // ✅ THÊM CÁC TRƯỜNG THEO THIẾT KẾ STREAK/Xp
+        currentXP: { type: Number, required: true, default: 0, min: 0 },
+        currentStreak: { type: Number, required: true, default: 0, min: 0 },
+        longestStreak: { type: Number, required: true, default: 0, min: 0 },
+        lastStudyDate: { type: Date, default: null }, // lưu ngày gần nhất có hoạt động (date)
     },
     { timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" } }
 );
