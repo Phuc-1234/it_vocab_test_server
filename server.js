@@ -7,7 +7,6 @@ const topicRoutes = require("./routes/topicRoutes")
 const profileRoutes = require("./routes/profileRoutes")
 const app = express();
 const cors = require('cors');
-
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
 
@@ -45,6 +44,7 @@ app.use('/auth', authRoutes);
 app.use('/quiz', quizRoutes);
 app.use('/topic', topicRoutes);
 app.use('/profile', profileRoutes);
+
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));

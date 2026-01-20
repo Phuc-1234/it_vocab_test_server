@@ -8,7 +8,7 @@ const { OAuth2Client } = require("google-auth-library");
 const User = require("../models/User.js");
 const Rank = require("../models/Rank.js");
 const UserRank = require("../models/UserRank.js");
-
+const { checkDisplayNameProfanity } = require("../utils/profanity");
 const { sha256, hashPassword, comparePassword } = require("../utils/crypto");
 const { genOtp6 } = require("../utils/otp");
 const {
@@ -119,6 +119,22 @@ module.exports = {
                 return res.status(400).json({ message: "Thiếu email/password." });
             }
 
+            // ✅ NEW: kiểm tra name (nếu có gửi lên)
+            // - Nếu bạn muốn bắt buộc phải có tên: đổi điều kiện và message tương ứng.
+            if (name !== undefined && name !== null && String(name).trim() !== "") {
+                const normalizedName = normalizeName(name);
+                if (normalizedName === null) {
+                    await session.abortTransaction();
+                    return res.status(400).json({ message: "Name không hợp lệ (2-50 ký tự)." });
+                }
+
+                const pf = checkDisplayNameProfanity(normalizedName);
+                if (!pf.ok) {
+                    await session.abortTransaction();
+                    return res.status(400).json({ message: "Tên hiển thị không hợp lệ." });
+                }
+            }
+
             const existed = await User.findOne({ email }).session(session);
             if (existed) {
                 await session.abortTransaction();
@@ -129,7 +145,7 @@ module.exports = {
             const userArr = await User.create(
                 [
                     {
-                        name: name || null,
+                        name: name ? normalizeName(name) : null, // hoặc lưu normalizedName như trên để khỏi gọi lại
                         email,
                         passwordHash: await hashPassword(password),
                         isVerifiedMail: false,
@@ -163,6 +179,7 @@ module.exports = {
             session.endSession();
         }
     },
+
 
     // POST /auth/login
     async login(req, res) {
@@ -563,6 +580,56 @@ module.exports = {
             return res.status(401).json({ message: "Facebook login thất bại.", error: msg, status });
         } finally {
             session.endSession();
+        }
+    },
+
+    // PUT /auth/change-password (JWT required) { oldPassword, newPassword }
+    async changePassword(req, res) {
+        try {
+            const userId = req.user?.userId;
+            if (!userId) return res.status(401).json({ message: "Unauthorized." });
+
+            const { oldPassword, newPassword } = req.body || {};
+            if (!oldPassword || !newPassword) {
+                return res.status(400).json({ message: "Thiếu oldPassword/newPassword." });
+            }
+
+            // optional: chặn trùng password ngay từ input
+            if (String(oldPassword) === String(newPassword)) {
+                return res.status(400).json({ message: "Mật khẩu mới phải khác mật khẩu cũ." });
+            }
+
+            const user = await User.findById(userId);
+            if (!user) return res.status(404).json({ message: "User không tồn tại." });
+
+            const st = ensureActive(user);
+            if (!st.ok) return res.status(st.status).json({ message: st.message });
+
+            // Tài khoản social không có password
+            if (!user.passwordHash) {
+                return res.status(400).json({
+                    message: "Tài khoản này đăng nhập social, không có mật khẩu. Hãy dùng quên mật khẩu để tạo mật khẩu.",
+                });
+            }
+
+            const okOld = await comparePassword(oldPassword, user.passwordHash);
+            if (!okOld) return res.status(401).json({ message: "Mật khẩu cũ không đúng." });
+
+            // đảm bảo newPassword khác oldPassword theo hash (tránh case user nhập khác string nhưng vẫn match do trimming, v.v.)
+            const sameAsOld = await comparePassword(newPassword, user.passwordHash);
+            if (sameAsOld) {
+                return res.status(400).json({ message: "Mật khẩu mới phải khác mật khẩu cũ." });
+            }
+
+            user.passwordHash = await hashPassword(newPassword);
+
+            // revoke refresh token để logout các thiết bị khác (và buộc đăng nhập lại)
+            user.refreshTokenHash = null;
+            await user.save();
+
+            return res.json({ message: "Đổi mật khẩu thành công. Vui lòng đăng nhập lại." });
+        } catch (e) {
+            return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
 };

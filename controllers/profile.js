@@ -9,6 +9,7 @@ const Inventory = require("../models/Inventory");
 // ✅ NEW: stats sources
 const QuizAttempt = require("../models/QuizAttempt");
 const UserWordProgress = require("../models/UserWordProgress");
+const { checkDisplayNameProfanity } = require("../utils/profanity");
 
 const { uploadAvatarToCloudinary } = require("../services/cloudinaryUpload");
 
@@ -215,6 +216,13 @@ module.exports = {
             const nextName = normalizeName(req.body?.name);
             if (req.body?.name !== undefined && nextName === null) {
                 return res.status(400).json({ message: "Name không hợp lệ (2-50 ký tự)." });
+            }
+
+            if (typeof nextName === "string") {
+                const pf = checkDisplayNameProfanity(nextName);
+                if (!pf.ok) {
+                    return res.status(400).json({ message: "Tên hiển thị không hợp lệ." });
+                }
             }
 
             const nextPhone = normalizePhone(req.body?.phone);

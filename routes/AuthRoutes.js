@@ -19,5 +19,5 @@ router.post("/logout", auth, c.logout);
 
 router.post("/google", c.google);
 router.post("/facebook", c.facebook);
-
+router.put("/change-password", auth, c.changePassword);
 module.exports = router;
