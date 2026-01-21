@@ -5,6 +5,8 @@ const authRoutes = require("./routes/authRoutes")
 const quizRoutes = require("./routes/quizRoutes")
 const topicRoutes = require("./routes/topicRoutes")
 const profileRoutes = require("./routes/profileRoutes")
+const dictionaryRoutes = require("./routes/dictionaryRoutes")
+const feedbackRoutes = require("./routes/feedbackRoutes")
 const app = express();
 const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
@@ -44,6 +46,8 @@ app.use('/auth', authRoutes);
 app.use('/quiz', quizRoutes);
 app.use('/topic', topicRoutes);
 app.use('/profile', profileRoutes);
+app.use('/dictionary', dictionaryRoutes);
+app.use('/feedback', feedbackRoutes);
 
 
 const PORT = process.env.PORT || 5000;
