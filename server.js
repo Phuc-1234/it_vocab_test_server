@@ -6,6 +6,7 @@ const quizRoutes = require("./routes/quizRoutes")
 const topicRoutes = require("./routes/topicRoutes")
 const profileRoutes = require("./routes/profileRoutes")
 const leaderboardRoutes = require("./routes/leaderboardRoutes")
+const inventoryRoutes = require("./routes/inventoryRoutes");
 const app = express();
 const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
@@ -46,6 +47,7 @@ app.use('/quiz', quizRoutes);
 app.use('/topic', topicRoutes);
 app.use('/profile', profileRoutes);
 app.use('/leaderboard', leaderboardRoutes);
+app.use('/inventory', inventoryRoutes);
 
 
 const PORT = process.env.PORT || 5000;
