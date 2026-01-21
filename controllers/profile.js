@@ -284,4 +284,7 @@ module.exports = {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
+    async getSkinInfo(userId) {
+        return await getSkinInfo(userId);
+    }
 };

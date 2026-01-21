@@ -9,7 +9,7 @@ const ItemSchema = new mongoose.Schema(
 
         itemImageURL: { type: String, default: null },
 
-        itemType: { type: String, required: true }, // ví dụ: BOOST, FREEZE, ...
+        itemType: { type: String, required: true }, // ví dụ: BOOST, FREEZE, SKIN, VFX...
         durationType: { type: String, default: null }, // ví dụ: MINUTES, DAYS, ONCE...
         durationValue: { type: Number, default: null, min: 0 },
 
@@ -18,7 +18,7 @@ const ItemSchema = new mongoose.Schema(
         effectType: { type: String, required: true }, // ví dụ: XP_MULTIPLIER, STREAK_PROTECT...
         effectValue: { type: Number, default: null },
     },
-    { timestamps: true }
+    { timestamps: true },
 );
 
 ItemSchema.index({ itemType: 1 });
