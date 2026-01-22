@@ -5,6 +5,8 @@ const authRoutes = require("./routes/authRoutes")
 const quizRoutes = require("./routes/quizRoutes")
 const topicRoutes = require("./routes/topicRoutes")
 const profileRoutes = require("./routes/profileRoutes")
+const dictionaryRoutes = require("./routes/dictionaryRoutes")
+const feedbackRoutes = require("./routes/feedbackRoutes")
 const leaderboardRoutes = require("./routes/leaderboardRoutes")
 const app = express();
 const cors = require('cors');
@@ -45,6 +47,8 @@ app.use('/auth', authRoutes);
 app.use('/quiz', quizRoutes);
 app.use('/topic', topicRoutes);
 app.use('/profile', profileRoutes);
+app.use('/dictionary', dictionaryRoutes);
+app.use('/feedback', feedbackRoutes);
 app.use('/leaderboard', leaderboardRoutes);
 
 
