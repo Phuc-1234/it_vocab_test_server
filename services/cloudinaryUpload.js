@@ -21,6 +21,26 @@ function uploadBuffer({ buffer, folder, publicId }) {
     });
 }
 
+const uploadFileToCloudinary = (file, folder = "uploads") => {
+    return new Promise((resolve, reject) => {
+        const uploadStream = cloudinary.uploader.upload_stream(
+            {
+                folder: folder,
+                resource_type: "auto", // Tự động nhận diện ảnh/video
+            },
+            (error, result) => {
+                if (error) return reject(error);
+                resolve({
+                    url: result.secure_url,
+                    publicId: result.public_id,
+                });
+            }
+        );
+
+        streamifier.createReadStream(file.buffer).pipe(uploadStream);
+    });
+};
+
 module.exports = {
     async uploadAvatarToCloudinary({ userId, file }) {
         const result = await uploadBuffer({
@@ -34,4 +54,6 @@ module.exports = {
             publicId: result.public_id,
         };
     },
+
+    uploadFileToCloudinary,
 };

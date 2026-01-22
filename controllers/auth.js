@@ -7,7 +7,7 @@ const { OAuth2Client } = require("google-auth-library");
 
 const User = require("../models/User.js");
 const Rank = require("../models/Rank.js");
-const UserRank = require("../models/UserRank.js");
+const UserRankHistory = require("../models/UserRankHistory");
 const { checkDisplayNameProfanity } = require("../utils/profanity");
 const { sha256, hashPassword, comparePassword } = require("../utils/crypto");
 const { genOtp6 } = require("../utils/otp");
@@ -32,6 +32,12 @@ const OTP_COOLDOWN_SEC = Number(process.env.OTP_COOLDOWN_SEC || 60);
 
 /* ===================== HELPERS ===================== */
 
+function normalizeName(s) {
+    const v = String(s || "").trim().replace(/\s+/g, " ");
+    if (v.length < 2 || v.length > 50) return null;
+    return v;
+}
+
 function normalizePurpose(p) {
     const v = String(p || "").toLowerCase();
     return v === "signup" || v === "reset_password" ? v : null;
@@ -44,14 +50,16 @@ function ensureActive(user) {
     return { ok: true };
 }
 
-async function issueTokensAndRotateRefresh(user) {
+async function issueTokensAndRotateRefresh(user, session) {
     const payload = { userId: String(user._id), role: user.role, email: user.email };
 
     const accessToken = signAccessToken(payload);
     const refreshToken = signRefreshToken(payload);
 
     user.refreshTokenHash = sha256(refreshToken);
-    await user.save();
+
+    if (session) await user.save({ session });
+    else await user.save();
 
     return { accessToken, refreshToken };
 }
@@ -86,20 +94,54 @@ async function checkStreakOnLogin(user) {
 }
 
 /**
- * Ensure user có UserRank level 1 (upsert chống trùng)
+ * Ensure user có Rank level 1 trong UserRankHistory (isCurrent=true)
+ * - Nếu đã có current thì không tạo nữa
+ * - Nếu có lịch sử nhưng không có current (data lỗi) => auto-fix: set rank1 current
+ *
+ * NOTE (quan trọng để chống spam nhiều request):
+ * - NÊN thêm unique partial index ở schema UserRankHistory:
+ *   schema.index({ userId: 1, isCurrent: 1 }, { unique: true, partialFilterExpression: { isCurrent: true } })
+ * - Khi có index này, đoạn catch(err.code===11000) sẽ giúp tránh tạo 2 current nếu user fire nhiều API cùng lúc.
  */
 async function ensureUserRankLv1(userId, session) {
-    const q = Rank.findOne({ rankLevel: 1 });
+    const q = Rank.findOne({ rankLevel: 1 }).select("_id rankLevel rankName neededXP");
     if (session) q.session(session);
     const rankLv1 = await q;
 
     if (!rankLv1) throw new Error("Thiếu dữ liệu Rank level 1 trong DB.");
 
-    await UserRank.updateOne(
-        { userId, rankId: rankLv1._id },
-        { $setOnInsert: { userId, rankId: rankLv1._id, achievedDate: new Date() } },
-        { upsert: true, ...(session ? { session } : {}) }
+    // nếu đã có current => ok
+    const curQ = UserRankHistory.findOne({ userId, isCurrent: true }).sort({ achievedDate: -1 });
+    if (session) curQ.session(session);
+    const current = await curQ;
+    if (current) return rankLv1;
+
+    // đóng mọi current (phòng data bẩn)
+    await UserRankHistory.updateMany(
+        { userId, isCurrent: true },
+        { $set: { isCurrent: false, endedAt: new Date(), resetReason: "AUTO_FIX" } },
+        { ...(session ? { session } : {}) }
     );
+
+    // tạo Rank 1 làm current (nếu có unique index, concurrent sẽ dính E11000 -> ignore)
+    try {
+        await UserRankHistory.create(
+            [
+                {
+                    userId,
+                    rankId: rankLv1._id,
+                    achievedDate: new Date(),
+                    isCurrent: true,
+                    endedAt: null,
+                    resetReason: null,
+                },
+            ],
+            { ...(session ? { session } : {}) }
+        );
+    } catch (err) {
+        if (err?.code !== 11000) throw err;
+        // duplicate key => request khác đã tạo current rồi, coi như OK
+    }
 
     return rankLv1;
 }
@@ -119,8 +161,7 @@ module.exports = {
                 return res.status(400).json({ message: "Thiếu email/password." });
             }
 
-            // ✅ NEW: kiểm tra name (nếu có gửi lên)
-            // - Nếu bạn muốn bắt buộc phải có tên: đổi điều kiện và message tương ứng.
+            // kiểm tra name (nếu có gửi lên)
             if (name !== undefined && name !== null && String(name).trim() !== "") {
                 const normalizedName = normalizeName(name);
                 if (normalizedName === null) {
@@ -141,18 +182,17 @@ module.exports = {
                 return res.status(409).json({ message: "Email đã tồn tại." });
             }
 
-            // Lưu ý: User schema phải có các field: currentXP/currentStreak/longestStreak/lastStudyDate
             const userArr = await User.create(
                 [
                     {
-                        name: name ? normalizeName(name) : null, // hoặc lưu normalizedName như trên để khỏi gọi lại
+                        name: name ? normalizeName(name) : null,
                         email,
                         passwordHash: await hashPassword(password),
                         isVerifiedMail: false,
                         role: "USER",
                         status: "ACTIVE",
 
-                        // ✅ init streak/xp
+                        // init streak/xp
                         currentXP: 0,
                         currentStreak: 0,
                         longestStreak: 0,
@@ -164,7 +204,7 @@ module.exports = {
 
             const createdUser = userArr[0];
 
-            // ✅ create UserRank level 1
+            // create UserRank level 1
             await ensureUserRankLv1(createdUser._id, session);
 
             await session.commitTransaction();
@@ -179,7 +219,6 @@ module.exports = {
             session.endSession();
         }
     },
-
 
     // POST /auth/login
     async login(req, res) {
@@ -200,7 +239,7 @@ module.exports = {
             const ok = await comparePassword(password, user.passwordHash);
             if (!ok) return res.status(401).json({ message: "Sai thông tin đăng nhập." });
 
-            // ✅ check streak ngay khi login
+            // check streak ngay khi login
             await checkStreakOnLogin(user);
 
             const tokens = await issueTokensAndRotateRefresh(user);
@@ -271,7 +310,8 @@ module.exports = {
             }
 
             if (user.actionPurpose !== p) return res.status(400).json({ message: "Sai mục đích OTP." });
-            if (user.actionCodeExpiredAt.getTime() < Date.now()) return res.status(400).json({ message: "OTP đã hết hạn." });
+            if (user.actionCodeExpiredAt.getTime() < Date.now())
+                return res.status(400).json({ message: "OTP đã hết hạn." });
             if (sha256(code) !== user.actionCodeHash) return res.status(400).json({ message: "OTP không đúng." });
 
             // clear ActionCode*
@@ -429,25 +469,29 @@ module.exports = {
 
             await user.save({ session });
 
-            // ✅ tạo UserRank lv1 nếu tạo mới (upsert an toàn)
+            // tạo UserRank lv1 nếu tạo mới
             if (isNewUser) {
                 await ensureUserRankLv1(user._id, session);
             }
 
             await session.commitTransaction();
 
-            // ✅ check streak ngay khi login social (nếu muốn áp dụng y hệt login thường)
-            await checkStreakOnLogin(user);
+            // reload user doc “fresh” sau transaction
+            const freshUser = await User.findById(user._id);
+            if (!freshUser) return res.status(404).json({ message: "User không tồn tại." });
 
-            const tokens = await issueTokensAndRotateRefresh(user);
+            // check streak ngay khi login social
+            await checkStreakOnLogin(freshUser);
+
+            const tokens = await issueTokensAndRotateRefresh(freshUser);
             return res.json({
                 ...tokens,
                 user: {
-                    userId: String(user._id),
-                    currentXP: user.currentXP ?? 0,
-                    currentStreak: user.currentStreak ?? 0,
-                    longestStreak: user.longestStreak ?? 0,
-                    lastStudyDate: user.lastStudyDate ?? null,
+                    userId: String(freshUser._id),
+                    currentXP: freshUser.currentXP ?? 0,
+                    currentStreak: freshUser.currentStreak ?? 0,
+                    longestStreak: freshUser.longestStreak ?? 0,
+                    lastStudyDate: freshUser.lastStudyDate ?? null,
                 },
             });
         } catch (e) {
@@ -551,25 +595,27 @@ module.exports = {
 
             await user.save({ session });
 
-            // ✅ tạo UserRank lv1 nếu tạo mới
+            // tạo UserRank lv1 nếu tạo mới
             if (isNewUser) {
                 await ensureUserRankLv1(user._id, session);
             }
 
             await session.commitTransaction();
 
-            // ✅ check streak ngay khi login social
-            await checkStreakOnLogin(user);
+            const freshUser = await User.findById(user._id);
+            if (!freshUser) return res.status(404).json({ message: "User không tồn tại." });
 
-            const tokens = await issueTokensAndRotateRefresh(user);
+            await checkStreakOnLogin(freshUser);
+
+            const tokens = await issueTokensAndRotateRefresh(freshUser);
             return res.json({
                 ...tokens,
                 user: {
-                    userId: String(user._id),
-                    currentXP: user.currentXP ?? 0,
-                    currentStreak: user.currentStreak ?? 0,
-                    longestStreak: user.longestStreak ?? 0,
-                    lastStudyDate: user.lastStudyDate ?? null,
+                    userId: String(freshUser._id),
+                    currentXP: freshUser.currentXP ?? 0,
+                    currentStreak: freshUser.currentStreak ?? 0,
+                    longestStreak: freshUser.longestStreak ?? 0,
+                    lastStudyDate: freshUser.lastStudyDate ?? null,
                 },
             });
         } catch (e) {
@@ -594,7 +640,7 @@ module.exports = {
                 return res.status(400).json({ message: "Thiếu oldPassword/newPassword." });
             }
 
-            // optional: chặn trùng password ngay từ input
+            // chặn trùng password ngay từ input
             if (String(oldPassword) === String(newPassword)) {
                 return res.status(400).json({ message: "Mật khẩu mới phải khác mật khẩu cũ." });
             }
@@ -608,14 +654,15 @@ module.exports = {
             // Tài khoản social không có password
             if (!user.passwordHash) {
                 return res.status(400).json({
-                    message: "Tài khoản này đăng nhập social, không có mật khẩu. Hãy dùng quên mật khẩu để tạo mật khẩu.",
+                    message:
+                        "Tài khoản này đăng nhập social, không có mật khẩu. Hãy dùng quên mật khẩu để tạo mật khẩu.",
                 });
             }
 
             const okOld = await comparePassword(oldPassword, user.passwordHash);
             if (!okOld) return res.status(401).json({ message: "Mật khẩu cũ không đúng." });
 
-            // đảm bảo newPassword khác oldPassword theo hash (tránh case user nhập khác string nhưng vẫn match do trimming, v.v.)
+            // đảm bảo newPassword khác oldPassword theo hash
             const sameAsOld = await comparePassword(newPassword, user.passwordHash);
             if (sameAsOld) {
                 return res.status(400).json({ message: "Mật khẩu mới phải khác mật khẩu cũ." });
@@ -623,7 +670,7 @@ module.exports = {
 
             user.passwordHash = await hashPassword(newPassword);
 
-            // revoke refresh token để logout các thiết bị khác (và buộc đăng nhập lại)
+            // revoke refresh token để logout các thiết bị khác
             user.refreshTokenHash = null;
             await user.save();
 

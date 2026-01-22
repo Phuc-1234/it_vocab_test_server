@@ -2,20 +2,20 @@
 const mongoose = require("mongoose");
 
 const User = require("../models/User");
-const UserRank = require("../models/UserRank");
+const UserRankHistory = require("../models/UserRankHistory");
 const Rank = require("../models/Rank");
-const Inventory = require("../models/Inventory");
-
-// ✅ NEW: stats sources
+const Inventory = require("../models/Inventory"); // ✅ đúng model mới (không còn isActive)
+const RewardInbox = require("../models/RewardInbox");
 const QuizAttempt = require("../models/QuizAttempt");
 const UserWordProgress = require("../models/UserWordProgress");
+const UserEquipped = require("../models/UserEquipped"); // ✅ equipped skin/frame
 const { checkDisplayNameProfanity } = require("../utils/profanity");
-
 const { uploadAvatarToCloudinary } = require("../services/cloudinaryUpload");
 
-// ===== Normalizers =====
+/* ===================== NORMALIZERS ===================== */
+
 function normalizeName(name) {
-    if (name == null) return undefined; // không update
+    if (name == null) return undefined;
     if (typeof name !== "string") return null;
     const trimmed = name.trim().replace(/\s+/g, " ");
     if (trimmed.length < 2 || trimmed.length > 50) return null;
@@ -23,97 +23,132 @@ function normalizeName(name) {
 }
 
 function normalizePhone(phone) {
-    if (phone == null) return undefined; // không update
+    if (phone == null) return undefined;
     if (typeof phone !== "string") return null;
 
     const trimmed = phone.trim();
     if (trimmed.length === 0) return null;
-
-    // validate nhẹ
-    const ok = /^[0-9+\-() ]{6,30}$/.test(trimmed);
-    if (!ok) return null;
+    if (!/^[0-9+\-() ]{6,30}$/.test(trimmed)) return null;
 
     return trimmed;
 }
 
-// ===== Rank / Skin helpers =====
-// ✅ INCREMENTAL RANK: neededEXP = ngưỡng XP để lên rank kế tiếp
-// - currentRank lấy theo latest UserRank (fallback rankLevel=1)
-// - nextRank = currentRank.rankLevel + 1
-async function computeRankInfo(userId) {
-    const latestUserRank = await UserRank.findOne({ userId })
-        .sort({ achievedDate: -1 })
+/* ===================== RANK HELPERS (INCREMENTAL) ===================== */
+
+async function computeRankInfo(userId, currentXP) {
+    // ✅ rank hiện tại theo isCurrent
+    let history = await UserRankHistory.findOne({
+        userId,
+        isCurrent: true,
+    })
         .populate("rankId")
         .lean();
 
-    let currentRankDoc = latestUserRank?.rankId || null;
+    let currentRankDoc = history?.rankId;
 
     if (!currentRankDoc) {
         currentRankDoc = await Rank.findOne({ rankLevel: 1 }).lean();
     }
 
-    const currentLevel = Number(currentRankDoc?.rankLevel || 1);
+    if (!currentRankDoc) return { currentRank: null, nextRank: null };
 
-    const nextRankDoc = await Rank.findOne({ rankLevel: currentLevel + 1 }).lean();
+    // ✅ Alias neededEXP cho FE, giữ neededXP cho BE
+    const currentNeededXP = Number(currentRankDoc.neededXP || 0);
 
-    const currentRank = currentRankDoc
-        ? {
-            rankId: currentRankDoc._id,
-            rankLevel: currentRankDoc.rankLevel,
-            rankName: currentRankDoc.rankName,
-            neededEXP: currentRankDoc.neededEXP,
-        }
-        : null;
+    const currentRank = {
+        rankId: currentRankDoc._id,
+        rankLevel: currentRankDoc.rankLevel,
+        rankName: currentRankDoc.rankName,
+        neededXP: currentNeededXP,
+    };
+
+    const nextRankDoc = await Rank.findOne({
+        rankLevel: Number(currentRankDoc.rankLevel) + 1,
+    }).lean();
 
     const nextRank = nextRankDoc
         ? {
             rankId: nextRankDoc._id,
             rankLevel: nextRankDoc.rankLevel,
             rankName: nextRankDoc.rankName,
-            neededEXP: nextRankDoc.neededEXP, // ✅ ngưỡng để lên rank này
+
+            // BE chuẩn
+            neededXP: Number(nextRankDoc.neededXP || 0),
+
+            remainingXP: Math.max(0, nextRankDoc.neededXP - Number(currentXP || 0)),
         }
         : null;
 
     return { currentRank, nextRank };
 }
 
+/* ===================== SKIN HELPERS ===================== */
+
+/**
+ * ✅ Inventory mới không có isActive nữa
+ * -> trả về list skins user sở hữu (quantity + item info)
+ */
 async function getSkinInfo(userId) {
-    const inv = await Inventory.find({ userId, isActive: true }).populate("itemId").lean();
+    const inv = await Inventory.find({ userId })
+        .populate("itemId")
+        .lean();
 
     const skins = inv
-        .filter((x) => x.itemId && x.itemId.itemType === "SKIN")
+        .filter((x) => x.itemId?.itemType === "SKIN")
         .map((x) => ({
             inventoryId: x._id,
-            itemId: x.itemId._id,
-            itemName: x.itemId.itemName,
-            itemImageURL: x.itemId.itemImageURL,
+            itemId: x.itemId?._id,
+            itemName: x.itemId?.itemName,
+            itemImageURL: x.itemId?.itemImageURL ?? null,
             quantity: x.quantity,
-            activatedAt: x.activatedAt,
-            expiredAt: x.expiredAt,
-            isActive: x.isActive,
+            acquireAt: x.acquireAt ?? null,
+            sourceInboxId: x.sourceInboxId ?? null,
         }));
 
-    // Rule: activeSkin = skin có activatedAt mới nhất
-    const activeSkin =
-        skins.filter((s) => s.activatedAt).sort((a, b) => new Date(b.activatedAt) - new Date(a.activatedAt))[0] ||
-        null;
-
-    return { skins, activeSkin };
+    // ✅ Không còn activeSkin theo Inventory nữa
+    return { skins };
 }
 
-// ===== Stats helpers (cho Profile UI) =====
+/**
+ * ✅ Lấy item đang equipped từ UserEquipped
+ * slotType tuỳ bạn đang lưu, ở đây ưu tiên thử vài value phổ biến.
+ */
+async function getEquippedSkinInfo(userId) {
+    const slotTypesToTry = ["SKIN", "FRAME", "AVATAR_FRAME"];
+
+    let equipped = null;
+    for (const slotType of slotTypesToTry) {
+        equipped = await UserEquipped.findOne({ userId, slotType })
+            .populate("itemId")
+            .lean();
+        if (equipped) break;
+    }
+
+    if (!equipped || !equipped.itemId) return null;
+
+    return {
+        userEquippedId: equipped._id,
+        slotType: equipped.slotType,
+        equippedAt: equipped.equippedAt ?? null,
+
+        itemId: equipped.itemId._id,
+        itemName: equipped.itemId.itemName,
+        itemImageURL: equipped.itemId.itemImageURL ?? null,
+        itemType: equipped.itemId.itemType,
+    };
+}
+
+/* ===================== STATS ===================== */
+
 async function computeProfileStats(userId) {
     const uid = new mongoose.Types.ObjectId(String(userId));
 
-    // lessonsDone + accuracy
     const attemptAgg = await QuizAttempt.aggregate([
         {
             $match: {
                 userId: uid,
                 isGuest: false,
                 status: "FINISHED",
-                // tuỳ bạn muốn tính mode nào vào Statistics:
-                // nếu chỉ muốn TOPIC thì đổi $in: ["TOPIC"]
                 mode: { $in: ["TOPIC"] },
             },
         },
@@ -130,7 +165,6 @@ async function computeProfileStats(userId) {
     const a = attemptAgg[0] || { lessonsDone: 0, totalQuestions: 0, correctAnswers: 0 };
     const accuracy = a.totalQuestions > 0 ? Math.round((a.correctAnswers / a.totalQuestions) * 100) : 0;
 
-    // wordsLearned (đơn giản: studyLevel > 0)
     const wordsLearned = await UserWordProgress.countDocuments({
         userId: uid,
         studyLevel: { $gt: 0 },
@@ -143,74 +177,105 @@ async function computeProfileStats(userId) {
     };
 }
 
+/* ===================== CONTROLLER ===================== */
+
 module.exports = {
-    // GET /profile (JWT required)
+    // GET /profile
     async getProfile(req, res) {
         try {
             const userId = req.user?.userId;
             if (!mongoose.Types.ObjectId.isValid(userId)) {
-                return res.status(401).json({ message: "Vui lòng đăng nhập để tiếp tục." });
+                return res.status(401).json({ message: "Vui lòng đăng nhập." });
             }
 
             const user = await User.findById(userId).lean();
             if (!user) return res.status(404).json({ message: "User không tồn tại." });
 
-            // ✅ INCREMENTAL: currentXP là XP trong rank hiện tại
-            const currentXP = user.currentXP ?? 0;
+            const currentXP = Number(user.currentXP || 0);
 
-            // ✅ chạy song song cho nhanh
-            const [{ currentRank, nextRank }, { skins, activeSkin }, stats] = await Promise.all([
-                computeRankInfo(user._id),
-                getSkinInfo(user._id),
-                computeProfileStats(user._id),
-            ]);
+            // ===== Rank (you only want minimal fields like sample) =====
+            const { currentRank, nextRank } = await computeRankInfo(user._id, currentXP);
 
-            // ✅ remainingEXP theo incremental threshold
-            const nextRankWithRemain = nextRank
-                ? {
-                    ...nextRank,
-                    remainingEXP: Math.max(0, Number(nextRank.neededEXP || 0) - Number(currentXP || 0)),
+            // ===== Equipped skin (only fields like sample) =====
+            const equipped = await (async () => {
+                const slotTypesToTry = ["SKIN", "FRAME", "AVATAR_FRAME"];
+                let doc = null;
+
+                for (const slotType of slotTypesToTry) {
+                    doc = await UserEquipped.findOne({ userId: user._id, slotType })
+                        .populate("itemId")
+                        .lean();
+                    if (doc) break;
                 }
-                : null;
 
+                if (!doc?.itemId) return null;
+
+                return {
+                    slotType: doc.slotType,
+                    itemName: doc.itemId.itemName,
+                    itemImageURL: doc.itemId.itemImageURL ?? null,
+                };
+            })();
+
+            // ===== Stats =====
+            const stats = await computeProfileStats(user._id);
+
+            // ===== Unclaimed rewards count =====
+            const unclaimedRewardsCount = await RewardInbox.countDocuments({
+                userId: user._id,
+                claimedAt: null,
+            });
+
+            // ===== Build EXACT response like your sample JSON =====
             return res.json({
                 message: "Lấy profile thành công.",
                 user: {
                     userId: user._id,
                     name: user.name,
-                    avatarURL: user.avatarURL,
-                    phone: user.phone,
+                    avatarURL: user.avatarURL ?? null,
+                    phone: user.phone ?? null,
 
-                    // streak/xp
                     currentXP,
                     currentStreak: user.currentStreak ?? 0,
                     longestStreak: user.longestStreak ?? 0,
                     lastStudyDate: user.lastStudyDate ?? null,
 
-                    // rank
-                    currentRank,
-                    nextRank: nextRankWithRemain,
+                    currentRank: currentRank
+                        ? {
+                            rankLevel: currentRank.rankLevel,
+                            rankName: currentRank.rankName,
+                        }
+                        : null,
 
-                    // skin
-                    skins,
-                    activeSkin,
+                    nextRank: nextRank
+                        ? {
+                            neededXP: nextRank.neededXP ?? nextRank.neededEXP ?? 0,
+                            remainingXP: nextRank.remainingXP ?? nextRank.remainingEXP ?? 0,
+                        }
+                        : null,
 
-                    // ✅ NEW: stats + memberSince cho UI
-                    stats,
+                    equippedSkin: equipped,
+
+                    stats: {
+                        lessonsDone: stats?.lessonsDone ?? 0,
+                        wordsLearned: stats?.wordsLearned ?? 0,
+                        accuracy: stats?.accuracy ?? 0,
+                    },
+
                     memberSince: user.createdAt ?? null,
+                    unclaimedRewardsCount: Number(unclaimedRewardsCount || 0),
                 },
             });
         } catch (e) {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
-
-    // PUT /profile  (JWT required)
+    // PUT /profile
     async updateProfile(req, res) {
         try {
             const userId = req.user?.userId;
             if (!mongoose.Types.ObjectId.isValid(userId)) {
-                return res.status(401).json({ message: "Vui lòng đăng nhập để tiếp tục." });
+                return res.status(401).json({ message: "Vui lòng đăng nhập." });
             }
 
             const nextName = normalizeName(req.body?.name);
@@ -230,10 +295,9 @@ module.exports = {
                 return res.status(400).json({ message: "Phone không hợp lệ." });
             }
 
-            // chỉ cho sửa name/phone, không nhận email/role/status
             const update = {};
-            if (nextName !== undefined) update.name = nextName; // null => clear
-            if (nextPhone !== undefined) update.phone = nextPhone; // null => clear
+            if (nextName !== undefined) update.name = nextName;
+            if (nextPhone !== undefined) update.phone = nextPhone;
 
             const user = await User.findByIdAndUpdate(userId, update, { new: true, lean: true });
             if (!user) return res.status(404).json({ message: "User không tồn tại." });
@@ -252,16 +316,15 @@ module.exports = {
         }
     },
 
-    // PUT /profile/avatar (JWT required, multipart/form-data)
+    // PUT /profile/avatar
     async updateAvatar(req, res) {
         try {
             const userId = req.user?.userId;
             if (!mongoose.Types.ObjectId.isValid(userId)) {
-                return res.status(401).json({ message: "Vui lòng đăng nhập để tiếp tục." });
+                return res.status(401).json({ message: "Vui lòng đăng nhập." });
             }
 
-            // upload.js memoryStorage => req.file.buffer
-            if (!req.file || !req.file.buffer) {
+            if (!req.file?.buffer) {
                 return res.status(400).json({ message: "Thiếu file avatar." });
             }
 

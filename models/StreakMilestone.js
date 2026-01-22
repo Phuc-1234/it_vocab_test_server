@@ -3,17 +3,10 @@ const mongoose = require("mongoose");
 
 const StreakMilestoneSchema = new mongoose.Schema(
     {
-        // _id = StreakID (theo hình)
-
-        dayNumber: { type: Number, required: true, min: 1, index: true },
-
-        rewardItemId: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "Item",
-            default: null,
-        },
-
+        // _id = StreakID
+        dayNumber: { type: Number, required: true, min: 1 },
         streakTitle: { type: String, required: true, trim: true, maxlength: 200 },
+        createdAt: { type: Date, default: Date.now },
     },
     { timestamps: true }
 );
