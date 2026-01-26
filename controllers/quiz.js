@@ -563,6 +563,10 @@ module.exports = {
     /**
      * GET /quizzes/topics?page=1&pageSize=20
      */
+    /**
+     * GET /quizzes/topics?page=1&pageSize=20
+     * Nếu có req.user (đã login) -> attach progress theo attempt TOPIC gần nhất của từng (topicId, level)
+     */
     async quizzesByTopicsPaginated(req, res) {
         try {
             const { page = 1, pageSize = 20 } = req.query;
@@ -589,6 +593,7 @@ module.exports = {
             }
             const end = Math.min(start + ps, total);
 
+            // Build items (topicId + level) for this page
             const items = [];
             let cursor = 0;
 
@@ -614,10 +619,90 @@ module.exports = {
                         level: lv,
                         title: `${topic.topicName} ${lv}`,
                         mode: "TOPIC",
+
+                        // default (guest / chưa có attempt)
+                        percentCorrect: 0,
+                        xp: 10 * 10, // default 10 câu * 10
+                        lastAttempt: null,
                     });
                 }
 
                 cursor = topicEnd;
+            }
+
+            // If logged in -> attach latest attempt per (topicId, level)
+            const userId = req.user?.userId || null;
+            if (userId && items.length) {
+                const topicIds = [...new Set(items.map((it) => String(it.topicId)))].map(
+                    (id) => new mongoose.Types.ObjectId(id)
+                );
+
+                const levels = [...new Set(items.map((it) => Number(it.level)))];
+
+                // Lấy attempt FINISHED gần nhất cho mỗi (topicId, level)
+                const latestAttempts = await QuizAttempt.aggregate([
+                    {
+                        $match: {
+                            userId: new mongoose.Types.ObjectId(String(userId)),
+                            mode: "TOPIC",
+                            status: "FINISHED",
+                            topicId: { $in: topicIds },
+                            level: { $in: levels },
+                        },
+                    },
+                    { $sort: { finishedAt: -1, createdAt: -1, _id: -1 } },
+                    {
+                        $group: {
+                            _id: { topicId: "$topicId", level: "$level" },
+                            doc: { $first: "$$ROOT" },
+                        },
+                    },
+                    {
+                        $project: {
+                            _id: 0,
+                            topicId: "$_id.topicId",
+                            level: "$_id.level",
+                            attemptId: "$doc._id",
+                            totalQuestions: { $ifNull: ["$doc.totalQuestions", 0] },
+                            correctAnswers: { $ifNull: ["$doc.correctAnswers", 0] },
+                            earnedXP: { $ifNull: ["$doc.earnedXP", 0] },
+                            finishedAt: "$doc.finishedAt",
+                            createdAt: "$doc.createdAt",
+                        },
+                    },
+                ]);
+
+                const map = new Map();
+                for (const a of latestAttempts) {
+                    const key = `${String(a.topicId)}_${Number(a.level)}`;
+                    const totalQ = Number(a.totalQuestions || 0);
+                    const correct = Number(a.correctAnswers || 0);
+
+                    const percentCorrect = totalQ > 0 ? Math.round((correct / totalQ) * 100) : 0;
+                    const xp = totalQ * 10; // ✅ theo yêu cầu: total question * 10
+
+                    map.set(key, {
+                        percentCorrect,
+                        xp,
+                        lastAttempt: {
+                            attemptId: a.attemptId,
+                            totalQuestions: totalQ,
+                            correctAnswers: correct,
+                            finishedAt: a.finishedAt ?? null,
+                        },
+                    });
+                }
+
+                // merge into items
+                for (const it of items) {
+                    const key = `${String(it.topicId)}_${Number(it.level)}`;
+                    const extra = map.get(key);
+                    if (extra) {
+                        it.percentCorrect = extra.percentCorrect;
+                        it.xp = extra.xp;
+                        it.lastAttempt = extra.lastAttempt;
+                    }
+                }
             }
 
             return res.json({ page: p, pageSize: ps, total, totalPages, items });

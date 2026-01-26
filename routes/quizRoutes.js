@@ -11,7 +11,7 @@ const c = require("../controllers/quiz");
 /**
  * GET /quiz/quizzes?page=&pageSize=
  */
-router.get("/quizzes", c.quizzesByTopicsPaginated);
+router.get("/quizzes", optionalAuth, c.quizzesByTopicsPaginated);
 
 // ========== ATTEMPTS ==========
 /**
