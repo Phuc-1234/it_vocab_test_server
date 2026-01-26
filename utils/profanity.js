@@ -41,10 +41,10 @@ function tokens(spaced) {
 
 // Placeholder: bạn thay bằng danh sách thật của bạn
 const BANNED_TERMS_VI = [
-    "djt", "đjt", "vcl", "vãi", "địt", "lồn", "cặc", "đụ", "buồi", "đéo", "đĩ", "đần", "ngu", "đần", "óc chó", "cứt", "đm", "dm", "cc", "cl", "vl", "vãi", "bựa", "bựa", "đụ mẹ", "đụ bố", "đụ con", "mẹ kiếp", "đm mẹ", "đm bố", "đm con", "tởm lợm", "thối tha"
+    "djt", "đjt", "vcl", "vãi", "địt", "lồn", "cặc", "đụ", "buồi", "đéo", "đĩ", "đần", "ngu", "đần", "óc chó", "cứt", "đm", "dm", "cc", "cl", "vl", "vãi", "bựa", "bựa", "đụ mẹ", "đụ bố", "đụ con", "mẹ kiếp", "tởm lợm", "thối tha", "cak", "l0`n", "cặt", "d1t"
 ];
 const BANNED_TERMS_EN = [
-    "fuck", "shit", "damn", "hell", "ass", "bitch", "bastard", "motherfucker", "cunt", "slut", "dickhead", "dick", "piss", "wank", "bollocks"
+    "fuck", "shit", "damn", "hell", "ass", "bitch", "bastard", "motherfucker", "cunt", "slut", "dickhead", "dick", "piss", "wank", "bollocks", "diddy"
 ];
 
 const DEFAULT_BANNED = [...BANNED_TERMS_VI, ...BANNED_TERMS_EN];

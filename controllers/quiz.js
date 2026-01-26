@@ -21,6 +21,17 @@ const INFINITE_BATCH_SIZE = 10;
 // ===== Helpers =====
 const MODES = ["TOPIC", "RANDOM", "INFINITE", "LEARN"];
 
+function shuffleCopy(arr) {
+    const a = Array.isArray(arr) ? [...arr] : [];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+}
+
+// ===== SR helpers =====
+// (SR logic uses daysForLevel() + calcOverduePenalty() and is applied in finish() for TOPIC mode)
 /**
  * Attempt summary DTO (lightweight for Android FE)
  */
@@ -72,6 +83,28 @@ function calcOverduePenalty(nextReviewDate, studyLevel, now = new Date()) {
     if (diffMs <= 0) return 0;
     const overdueDays = Math.floor(diffMs / (24 * 60 * 60 * 1000));
     return Math.min(studyLevel, overdueDays);
+}
+
+async function getFillCorrectContents({ question, optByQ, wordById }) {
+    // 1) ưu tiên AnswerOption.isCorrect
+    let contents = [];
+
+    if (optByQ) {
+        contents = (optByQ.get(String(question._id)) || [])
+            .filter((o) => o.isCorrect)
+            .map((o) => String(o.content || "").trim())
+            .filter(Boolean);
+    }
+
+    // 2) fallback sang Word (term/word) nếu options rỗng
+    if (!contents.length && question.wordId && wordById) {
+        const w = wordById.get(String(question.wordId)) || null;
+        const fallback = String(w?.term || w?.word || "").trim();
+        if (fallback) contents = [fallback];
+    }
+
+    // unique
+    return [...new Set(contents)];
 }
 
 async function computeRankInfo(userId) {
@@ -283,7 +316,7 @@ async function buildQuestionDtos(questions, includeWordInfo = false) {
             content: q.content,
             questionType: q.questionType,
             wordId: q.wordId ?? null,
-            options: optByQ.get(String(q._id)) || [],
+            options: shuffleCopy(optByQ.get(String(q._id)) || []),
             word: includeWordInfo ? pickWordInfo(w) : null,
             hint: includeWordInfo ? buildHintFromWord(w) : "",
         };
@@ -490,19 +523,27 @@ async function gradeAndSaveAttemptAnswer({ aa, question, selectedOptionId, answe
             return { ok: false, status: 400, message: "Thiếu answerText." };
         }
 
+        // lấy đáp án đúng từ AnswerOption.isCorrect (nếu có)
         const correctOpts = await AnswerOption.find({
             questionId: question._id,
             isCorrect: true,
             deletedAt: null,
             isActive: true,
-        })
-            .select("content")
-            .lean();
+        }).select("content").lean();
+
+        let correctContents = correctOpts.map((o) => String(o.content || "").trim()).filter(Boolean);
+
+        // fallback nếu không có correct option
+        if (!correctContents.length && question.wordId) {
+            const w = await Word.findById(question.wordId).select("term word").lean();
+            const fallback = String(w?.term || w?.word || "").trim();
+            if (fallback) correctContents = [fallback];
+        }
 
         const normalized = normalizeFill(answerText);
-        isCorrect = correctOpts.some((o) => normalizeFill(o.content) === normalized);
+        isCorrect = correctContents.some((c) => normalizeFill(c) === normalized);
 
-        correctAnswers = correctOpts.map((o) => o.content);
+        correctAnswers = correctContents; // để FE show
 
         aa.answerText = answerText;
         aa.selectedOptionId = null;
@@ -585,9 +626,9 @@ module.exports = {
         }
     },
 
-    /**
-     * POST /quiz/attempts
-     */
+    // ========================================================
+    // START (full) - dùng SR cho TOPIC/LEARN, giữ nguyên getTopicWordIdsBySR
+    // ========================================================
     async start(req, res) {
         try {
             const { mode, topicId, level, totalQuestions } = req.body || {};
@@ -672,17 +713,21 @@ module.exports = {
                     return res.status(400).json({ message: "Thiếu topicId/level." });
                 }
 
-                const wordIds = await getTopicWordIdsBySR({
+                // ✅ SR: lấy word theo NextReviewDate sớm nhất (hàm giữ nguyên)
+                // lấy dư để tránh thiếu câu do word không có question
+                const srWordIds = await getTopicWordIdsBySR({
                     topicId,
                     level,
                     userId: req.user?.userId,
                     isGuest: !isUser,
-                    limit: n,
+                    limit: isUser ? n * 5 : n,
                 });
 
-                questions = await pickOneQuestionPerWord(wordIds);
+                questions = await pickOneQuestionPerWord(srWordIds);
 
-                // ✅ chặn trùng ngay từ lúc bù extra
+                if (questions.length > n) questions = questions.slice(0, n);
+
+                // fallback bù nếu thiếu (hiếm)
                 const existedIds = questions.map((q) => q._id).filter(Boolean);
 
                 if (questions.length < n) {
@@ -694,7 +739,7 @@ module.exports = {
                                 isActive: true,
                                 deletedAt: null,
                                 wordId: { $ne: null }, // LEARN cần hint/word
-                                _id: { $nin: existedIds }, // ✅ không lấy lại câu đã có
+                                _id: { $nin: existedIds }, // không lấy lại câu đã có
                             },
                         },
                         { $sample: { size: missing } },
@@ -1274,6 +1319,9 @@ module.exports = {
     // const RankReward = require("../models/RankReward");
     // const StreakReward = require("../models/StreakReward");
 
+    // ========================================================
+    // FINISH (full) - TOPIC update SR đúng bảng, LEARN/RANDOM/INFINITE không update
+    // ========================================================
     async finish(req, res) {
         const session = await mongoose.startSession();
         session.startTransaction();
@@ -1309,44 +1357,34 @@ module.exports = {
 
             const isUser = !!attempt.userId;
 
-            // ===================== XP CALC =====================
-            let xpBase = 0; // base XP before multiplier (includes perfect bonus)
-            let xpMultiplier = 1; // effect multiplier (1, 2, 1.5, ...)
+            // ===================== XP CALC (giữ nguyên logic của bạn) =====================
+            let xpBase = 0;
+            let xpMultiplier = 1;
             let xpMultiplierApplied = false;
-            let xpMultiplierSource = null; // optional, for FE display
-
+            let xpMultiplierSource = null;
             let earnedXP = 0;
 
             if (isUser && attempt.mode !== "LEARN") {
-                // ✅ mỗi câu đúng +10
                 xpBase = correct * 10;
+                if (total > 0 && correct === total) xpBase += 50;
 
-                // ✅ bonus đúng hết +50
-                if (total > 0 && correct === total) {
-                    xpBase += 50;
-                }
-
-                // ✅ lấy multiplier từ UserEffect đang active theo Item.effectType/effectValue
                 const now = new Date();
-
                 const activeEffects = await UserEffect.find({
                     userId: attempt.userId,
                     isActive: true,
                     startAt: { $lte: now },
                     $or: [{ endAt: null }, { endAt: { $gte: now } }],
                 })
-                    .populate("sourceItemId") // sourceItemId -> Item
+                    .populate("sourceItemId")
                     .session(session)
                     .lean();
 
-                // chọn multiplier lớn nhất (không stack)
                 let bestMultiplier = 1;
                 let bestSource = null;
 
                 for (const ef of activeEffects || []) {
                     const item = ef?.sourceItemId;
                     if (!item) continue;
-
                     if (String(item.effectType) === "XP_MULTIPLIER") {
                         const v = Number(item.effectValue);
                         if (Number.isFinite(v) && v > bestMultiplier) {
@@ -1379,14 +1417,81 @@ module.exports = {
 
             // ===================== UPDATE SR (only user + TOPIC) =====================
             if (isUser && attempt.mode === "TOPIC") {
-                // giữ nguyên logic SR của bạn (nếu có)
+                const nowSR = new Date();
+
+                // load questions to get wordId
+                const questionsSR = await Question.find({ _id: { $in: attempt.questionIds } })
+                    .select("_id wordId")
+                    .session(session)
+                    .lean();
+
+                const qToWord = new Map(
+                    (questionsSR || [])
+                        .filter((q) => q && q.wordId)
+                        .map((q) => [String(q._id), String(q.wordId)])
+                );
+
+                // aggregate per word: nếu có bất kỳ sai/null => reset
+                const wordAgg = new Map(); // wordId -> { hasWrong: boolean }
+                for (const a of answers || []) {
+                    const wid = qToWord.get(String(a.questionId));
+                    if (!wid) continue;
+
+                    const st = wordAgg.get(wid) || { hasWrong: false };
+                    if (a.isCorrect !== true) st.hasWrong = true; // false/null => sai
+                    wordAgg.set(wid, st);
+                }
+
+                for (const [wordId, st] of wordAgg.entries()) {
+                    const wordObjId = new mongoose.Types.ObjectId(wordId);
+
+                    // upsert progress
+                    let p = await UserWordProgress.findOne({
+                        userId: attempt.userId,
+                        wordId: wordObjId,
+                    }).session(session);
+
+                    if (!p) {
+                        const created = await UserWordProgress.create(
+                            [
+                                {
+                                    userId: attempt.userId,
+                                    wordId: wordObjId,
+                                    studyLevel: 0,
+                                    nextReviewDate: nowSR,
+                                    lastReviewDate: null,
+                                },
+                            ],
+                            { session }
+                        );
+                        p = created[0];
+                    }
+
+                    // overdue penalty first
+                    const penalty = calcOverduePenalty(p.nextReviewDate, p.studyLevel, nowSR);
+                    if (penalty > 0) {
+                        p.studyLevel = Math.max(Number(p.studyLevel || 0) - penalty, 0);
+                    }
+
+                    // update level by result
+                    if (st.hasWrong) {
+                        p.studyLevel = 0;
+                    } else {
+                        p.studyLevel = Math.max(Number(p.studyLevel || 0), 0) + 1;
+                    }
+
+                    p.lastReviewDate = nowSR;
+                    const days = daysForLevel(p.studyLevel);
+                    p.nextReviewDate = new Date(nowSR.getTime() + days * 24 * 60 * 60 * 1000);
+
+                    await p.save({ session });
+                }
             }
 
-            // ===================== UPDATE USER XP + STREAK + RANK + REWARDS =====================
+            // ===================== UPDATE USER XP + STREAK + RANK + REWARDS (giữ nguyên) =====================
             let userPayload = null;
             let rankPayload = null;
             let rankProgress = null;
-
             const newRewards = [];
 
             if (isUser && attempt.mode !== "LEARN") {
@@ -1399,10 +1504,9 @@ module.exports = {
                 const now = new Date();
                 const today = startOfDay(now);
 
-                // ✅ cộng XP (đã tính multiplier)
                 user.currentXP = Number(user.currentXP || 0) + Number(earnedXP || 0);
 
-                // ===== streak logic =====
+                // streak logic
                 let streakChanged = false;
 
                 if (!user.lastStudyDate) {
@@ -1430,8 +1534,7 @@ module.exports = {
                     { upsert: true, session }
                 );
 
-                // ===================== STREAK REWARD CHECK (FIXED) =====================
-                // ✅ chỉ tạo RewardInbox nếu milestone có reward trong StreakReward
+                // STREAK REWARD CHECK (giữ nguyên)
                 if (streakChanged) {
                     const milestone = await StreakMilestone.findOne({ dayNumber: user.currentStreak })
                         .session(session)
@@ -1470,7 +1573,7 @@ module.exports = {
                     }
                 }
 
-                // ===================== RANK / LEVEL UP LOGIC =====================
+                // RANK / LEVEL UP LOGIC (giữ nguyên)
                 let currentHistory = await UserRankHistory.findOne({
                     userId: user._id,
                     isCurrent: true,
@@ -1481,7 +1584,6 @@ module.exports = {
                     currentRankDoc = await Rank.findById(currentHistory.rankId).session(session).lean();
                 }
 
-                // Fallback init rank 1
                 if (!currentRankDoc) {
                     currentRankDoc = await Rank.findOne({ rankLevel: 1 }).session(session).lean();
                     const newHist = await UserRankHistory.create(
@@ -1498,8 +1600,7 @@ module.exports = {
                     currentHistory = newHist[0];
                 }
 
-                // ✅ cache exists(rankReward) để không query nhiều lần khi lên nhiều rank
-                const rankRewardCache = new Map(); // rankId(string) -> boolean
+                const rankRewardCache = new Map();
                 const hasRankReward = async (rankId) => {
                     const k = String(rankId);
                     if (rankRewardCache.has(k)) return rankRewardCache.get(k);
@@ -1513,15 +1614,13 @@ module.exports = {
                         .session(session)
                         .lean();
 
-                    if (!nextRankDoc) break; // Max level
+                    if (!nextRankDoc) break;
 
                     const requiredXP = Number(nextRankDoc.neededXP || 0);
 
                     if (user.currentXP >= requiredXP) {
-                        // trừ XP theo design hiện tại của bạn
                         user.currentXP -= requiredXP;
 
-                        // đóng rank cũ
                         if (currentHistory) {
                             await UserRankHistory.updateOne(
                                 { _id: currentHistory._id },
@@ -1530,7 +1629,6 @@ module.exports = {
                             );
                         }
 
-                        // mở rank mới
                         const newHist = await UserRankHistory.create(
                             [
                                 {
@@ -1544,8 +1642,6 @@ module.exports = {
                             { session }
                         );
 
-                        // ===================== RANK REWARD CHECK (FIXED) =====================
-                        // ✅ chỉ tạo RewardInbox nếu rank có reward trong RankReward
                         if (await hasRankReward(nextRankDoc._id)) {
                             const existingInbox = await RewardInbox.findOne({
                                 userId: user._id,
@@ -1581,7 +1677,6 @@ module.exports = {
                     }
                 }
 
-                // ===== Rank payload + progress =====
                 const targetRankDoc = await Rank.findOne({ rankLevel: currentRankDoc.rankLevel + 1 })
                     .session(session)
                     .lean();
@@ -1637,15 +1732,12 @@ module.exports = {
                     earnedXP: attempt.earnedXP,
                     status: attempt.status,
                 },
-
-                // ✅ FE biết có multiplier hay không
                 xpMeta: {
                     baseXP: xpBase,
                     multiplier: xpMultiplier,
                     applied: xpMultiplierApplied,
-                    source: xpMultiplierSource, // optional
+                    source: xpMultiplierSource,
                 },
-
                 ...(userPayload ? { user: userPayload } : {}),
                 ...(rankPayload ? { rank: rankPayload } : {}),
                 ...(rankProgress ? { rankProgress } : {}),
@@ -1659,10 +1751,6 @@ module.exports = {
             session.endSession();
         }
     },
-
-
-
-
 
     /**
      * GET /quiz-attempts?mode=&topicId=&from=&to=&page=1&pageSize=20
@@ -1777,6 +1865,18 @@ module.exports = {
                 const a = ansByQ.get(String(q._id)) || null;
                 const w = includeWordInfo ? wordById.get(String(q.wordId)) || null : null;
 
+                // ✅ recompute isCorrect for FILL_BLANK using normalized compare
+                let isCorrectView = a?.isCorrect ?? null;
+                if (q.questionType === "FILL_BLANK" && a?.answerText != null) {
+                    const correctNorms = (optByQ.get(String(q._id)) || [])
+                        .filter((o) => o.isCorrect)
+                        .map((o) => normalizeFill(o.content));
+
+                    if (correctNorms.length) {
+                        isCorrectView = correctNorms.includes(normalizeFill(a.answerText));
+                    }
+                }
+
                 return {
                     question: {
                         questionId: q._id,
@@ -1785,17 +1885,15 @@ module.exports = {
                         wordId: q.wordId ?? null,
                         word: includeWordInfo ? pickWordInfo(w) : null,
                         hint: includeWordInfo ? buildHintFromWord(w) : "",
-
-                        // ✅ NEW: phục vụ ReviewAnswersView
                         explanation: includeWordInfo ? buildExplanationFromWord(w) : "",
                         example: includeWordInfo ? buildExampleFromWord(w) : "",
                     },
-                    options: optByQ.get(String(q._id)) || [],
+                    options: shuffleCopy(optByQ.get(String(q._id)) || []),
                     userAnswer: a
                         ? {
                             selectedOptionId: a.selectedOptionId ?? null,
                             answerText: a.answerText ?? null,
-                            isCorrect: a.isCorrect ?? null,
+                            isCorrect: isCorrectView, // ✅ dùng kết quả đã normalize
                             answeredAt: a.answeredAt ?? null,
                         }
                         : null,
