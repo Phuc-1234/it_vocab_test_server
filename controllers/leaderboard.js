@@ -36,9 +36,6 @@ module.exports = {
             // ✅ optional auth: có token thì middleware optionalAuth set req.user
             const userId = req.user?.userId || null;
 
-            const todayStart = new Date();
-            todayStart.setHours(0, 0, 0, 0);
-
             let match = {};
             let sort = {};
 
@@ -46,7 +43,8 @@ module.exports = {
                 match = {};
                 sort = { currentXP: -1, _id: 1 };
             } else if (tab === "streak") {
-                match = { lastStudyDate: { $gte: todayStart } };
+                // ✅ SỬA LOGIC: Không check ngày nữa, chỉ cần có chuỗi > 0 là được hiện
+                match = { currentStreak: { $gt: 0 } };
                 sort = { currentStreak: -1, _id: 1 };
             } else {
                 return res.status(400).json({ message: "Invalid tab parameter" });
@@ -102,7 +100,7 @@ module.exports = {
                         avatarURL: 1,
                         currentXP: 1,
                         currentStreak: 1,
-                        lastStudyDate: 1,
+                        // lastStudyDate: 1, // Không cần thiết trả về nữa
                         currentRank: 1,
                     },
                 },
@@ -114,8 +112,8 @@ module.exports = {
             if (userId) {
                 const me = await User.findById(userId).lean();
 
-                if (tab === "xp") {
-                    if (me) {
+                if (me) {
+                    if (tab === "xp") {
                         const betterCount = await User.countDocuments({
                             $or: [
                                 { currentXP: { $gt: me.currentXP } },
@@ -124,20 +122,22 @@ module.exports = {
                         });
                         myPosition = betterCount + 1;
                     }
-                }
 
-                if (tab === "streak") {
-                    if (me && me.lastStudyDate && new Date(me.lastStudyDate) >= todayStart) {
-                        const betterCount = await User.countDocuments({
-                            ...match,
-                            $or: [
-                                { currentStreak: { $gt: me.currentStreak } },
-                                { currentStreak: me.currentStreak, _id: { $lt: me._id } },
-                            ],
-                        });
-                        myPosition = betterCount + 1;
-                    } else {
-                        myPosition = null;
+                    if (tab === "streak") {
+                        // ✅ SỬA LOGIC: Chỉ tính hạng nếu streak > 0
+                        if (me.currentStreak > 0) {
+                            const betterCount = await User.countDocuments({
+                                ...match, // currentStreak > 0
+                                $or: [
+                                    { currentStreak: { $gt: me.currentStreak } },
+                                    { currentStreak: me.currentStreak, _id: { $lt: me._id } },
+                                ],
+                            });
+                            myPosition = betterCount + 1;
+                        } else {
+                            // Nếu streak = 0 thì không có hạng
+                            myPosition = null;
+                        }
                     }
                 }
             }
