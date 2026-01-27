@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const { sendRateLimitAlert } = require('./services/mail');
 
 
 const mongoose = require('mongoose');
@@ -21,6 +22,37 @@ const rateLimit = require('express-rate-limit');
 
 
 app.set('trust proxy', 1); // để rate-limit bỏ qua proxy của render, nhìn ip của người dùng
+
+// Track rate limit alerts to prevent spam (one alert per IP per time window)
+const rateLimitAlerts = new Map();
+
+
+const recipientEmail = 'vdp.hh.1234@gmail.com, lieuthienhao2006@gmail.com';
+const sendRateLimitEmailAlert = async (ip, limiterType, windowMs, maxRequests) => {
+    const now = Date.now();
+    const alertKey = `${ip}-${limiterType}`;
+    const lastAlert = rateLimitAlerts.get(alertKey) || 0;
+    
+    // Only send email once per 15' per IP per limiter type to avoid spam
+    if (now - lastAlert > 15 * 60 * 1000) {
+        rateLimitAlerts.set(alertKey, now);
+
+
+
+        try {
+            await sendRateLimitAlert(
+                recipientEmail,
+                ip,
+                limiterType,
+                windowMs,
+                maxRequests
+            );
+            console.log(`[Rate Limit Alert] Email sent for IP: ${ip} (${limiterType})`);
+        } catch (err) {
+            console.error(`[Rate Limit Alert] Failed to send email for IP ${ip}:`, err.message);
+        }
+    }
+};
 
 const swaggerOptions = {
   definition: {
@@ -47,14 +79,23 @@ const generalLimiter = rateLimit({
   message: { message: "Quá nhiều yêu cầu, vui lòng thử lại sau 5 phút." },
   standardHeaders: true,
   legacyHeaders: false,
+  handler: (req, res) => {
+    sendRateLimitEmailAlert(req.ip, 'General Limiter', 5 * 60 * 1000, 500);
+    res.status(429).json({ message: "Quá nhiều yêu cầu, vui lòng thử lại sau 5 phút." });
+  },
 });
 
+const authLimiterDurationMinutes = 5;
 const authLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, // 5'
+  windowMs: authLimiterDurationMinutes * 60 * 1000, // 5'
   max: 150, //  150/5' -> 30/1'
   message: { message: "Thử đăng nhập quá nhiều lần. Tài khoản tạm khóa 5 phut nha." },
   standardHeaders: true,
   legacyHeaders: false,
+  handler: (req, res) => {
+    sendRateLimitEmailAlert(req.ip, 'Auth Limiter', authLimiterDurationMinutes * 60 * 1000, 150);
+    res.status(429).json({ message: "Thử đăng nhập quá nhiều lần. Tài khoản tạm khóa 5 phut nha." });
+  },
 });
 
 app.use(cors());

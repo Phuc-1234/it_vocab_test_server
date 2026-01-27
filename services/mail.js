@@ -18,4 +18,24 @@ async function sendOtpMail(to, code, purpose) {
     });
 }
 
-module.exports = { sendOtpMail };
+async function sendRateLimitAlert(to, ip, limiterType, windowMs, maxRequests) {
+    const timestamp = new Date().toISOString();
+    const subject = "🚨 Rate Limit Alert - IT Vocab Server";
+    const text =
+        `Rate Limit Triggered\n\n` +
+        `IP Address: ${ip}\n` +
+        `Limiter Type: ${limiterType}\n` +
+        `Window Duration: ${windowMs / 1000 / 60} minutes\n` +
+        `Max Requests: ${maxRequests}\n` +
+        `Time: ${timestamp}\n\n` +
+        `Action: This IP has exceeded the rate limit and requests are being blocked.`;
+
+    await transporter.sendMail({
+        from: process.env.MAIL_USER,
+        to,
+        subject,
+        text,
+    });
+}
+
+module.exports = { sendOtpMail, sendRateLimitAlert };
