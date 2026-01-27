@@ -1,5 +1,7 @@
 require('dotenv').config();
 const express = require('express');
+
+
 const mongoose = require('mongoose');
 const authRoutes = require("./routes/authRoutes")
 const quizRoutes = require("./routes/quizRoutes")
@@ -15,6 +17,10 @@ const app = express();
 const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
+const rateLimit = require('express-rate-limit');
+
+
+app.set('trust proxy', 1); // để rate-limit bỏ qua proxy của render, nhìn ip của người dùng
 
 const swaggerOptions = {
   definition: {
@@ -33,6 +39,24 @@ const swaggerOptions = {
   // Path to the API docs (where you will write your comments)
   apis: ['./routes/*.js'],
 };
+
+
+const generalLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5 minutes
+  max: 500, //   500/5' -> 100/1'
+  message: { message: "Quá nhiều yêu cầu, vui lòng thử lại sau 5 phút." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000, // 5'
+  max: 150, //  150/5' -> 30/1'
+  message: { message: "Thử đăng nhập quá nhiều lần. Tài khoản tạm khóa 5 phut nha." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use(cors());
 const swaggerDocs = swaggerJsdoc(swaggerOptions);
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocs));
@@ -44,9 +68,12 @@ mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('Connected to MongoDB Atlas'))
   .catch(err => console.error('Connection error:', err));
 
+// rate limit
+app.use(generalLimiter);
+
 
 // Use the routes
-app.use('/auth', authRoutes);
+app.use('/auth', authLimiter, authRoutes);
 app.use('/quiz', quizRoutes);
 app.use('/topic', topicRoutes);
 app.use('/profile', profileRoutes);
