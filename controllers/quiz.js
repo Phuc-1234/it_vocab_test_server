@@ -30,6 +30,33 @@ function shuffleCopy(arr) {
     return a;
 }
 
+// ===== TZ helpers (VN / Asia/Ho_Chi_Minh = UTC+7) =====
+const VN_TZ_OFFSET_MIN = 7 * 60;
+
+// Trả về "00:00 của ngày đó" theo timezone offset, nhưng dưới dạng Date UTC (để lưu DB nhất quán)
+function startOfDayWithOffset(date, tzOffsetMin = 0) {
+    const d = new Date(date);
+
+    // ms UTC
+    const utcMs = d.getTime() + d.getTimezoneOffset() * 60 * 1000;
+
+    // ms theo TZ target
+    const tzMs = utcMs + tzOffsetMin * 60 * 1000;
+    const tzDate = new Date(tzMs);
+    tzDate.setHours(0, 0, 0, 0);
+
+    // đổi ngược về UTC ms để lưu DB
+    const backUtcMs = tzDate.getTime() - tzOffsetMin * 60 * 1000;
+    return new Date(backUtcMs);
+}
+
+function diffDaysWithOffset(a, b, tzOffsetMin = 0) {
+    const a0 = startOfDayWithOffset(a, tzOffsetMin).getTime();
+    const b0 = startOfDayWithOffset(b, tzOffsetMin).getTime();
+    return Math.floor((a0 - b0) / (24 * 60 * 60 * 1000));
+}
+
+
 // ===== SR helpers =====
 // (SR logic uses daysForLevel() + calcOverduePenalty() and is applied in finish() for TOPIC mode)
 /**
@@ -1394,22 +1421,39 @@ module.exports = {
     /**
      * POST /quiz/attempts/:attemptId/finish
      */
-    /**
-     * POST /quiz/attempts/:attemptId/finish
-     */
-    // controllers/quizAttemptController.js (ONLY: finish function - full, corrected reward inbox logic)
-    // Assumes you already have: mongoose, QuizAttempt, AttemptAnswer, User, UserActivity, Rank, UserRankHistory,
-    // RewardInbox, StreakMilestone, UserEffect imported like your file.
-    // ✅ Add these imports at top of controller file:
-    // const RankReward = require("../models/RankReward");
-    // const StreakReward = require("../models/StreakReward");
-
     // ========================================================
     // FINISH (full) - TOPIC update SR đúng bảng, LEARN/RANDOM/INFINITE không update
+    // + Response trả thêm mode/topicId/level cho FE replay
+    // + Fix streak/UserActivity theo ngày VN (UTC+7) dù server chạy UTC+0
     // ========================================================
     async finish(req, res) {
         const session = await mongoose.startSession();
         session.startTransaction();
+
+        // ===== TZ helpers (VN / Asia/Ho_Chi_Minh = UTC+7) =====
+        const VN_TZ_OFFSET_MIN = 7 * 60;
+
+        function startOfDayWithOffset(date, tzOffsetMin = 0) {
+            const d = new Date(date);
+
+            // ms UTC
+            const utcMs = d.getTime() + d.getTimezoneOffset() * 60 * 1000;
+
+            // ms theo TZ target
+            const tzMs = utcMs + tzOffsetMin * 60 * 1000;
+            const tzDate = new Date(tzMs);
+            tzDate.setHours(0, 0, 0, 0);
+
+            // đổi ngược về UTC ms để lưu DB nhất quán
+            const backUtcMs = tzDate.getTime() - tzOffsetMin * 60 * 1000;
+            return new Date(backUtcMs);
+        }
+
+        function diffDaysWithOffset(a, b, tzOffsetMin = 0) {
+            const a0 = startOfDayWithOffset(a, tzOffsetMin).getTime();
+            const b0 = startOfDayWithOffset(b, tzOffsetMin).getTime();
+            return Math.floor((a0 - b0) / (24 * 60 * 60 * 1000));
+        }
 
         try {
             const { attemptId } = req.params;
@@ -1435,7 +1479,7 @@ module.exports = {
                 .lean();
 
             const total = Array.isArray(attempt.questionIds) ? attempt.questionIds.length : 0;
-            const correct = answers.filter((a) => a.isCorrect === true).length;
+            const correct = (answers || []).filter((a) => a.isCorrect === true).length;
 
             attempt.totalQuestions = total;
             attempt.correctAnswers = correct;
@@ -1573,7 +1617,7 @@ module.exports = {
                 }
             }
 
-            // ===================== UPDATE USER XP + STREAK + RANK + REWARDS (giữ nguyên) =====================
+            // ===================== UPDATE USER XP + STREAK + RANK + REWARDS (giữ nguyên, chỉ fix ngày VN) =====================
             let userPayload = null;
             let rankPayload = null;
             let rankProgress = null;
@@ -1587,7 +1631,7 @@ module.exports = {
                 }
 
                 const now = new Date();
-                const today = startOfDay(now);
+                const today = startOfDayWithOffset(now, VN_TZ_OFFSET_MIN);
 
                 user.currentXP = Number(user.currentXP || 0) + Number(earnedXP || 0);
 
@@ -1600,7 +1644,8 @@ module.exports = {
                     user.lastStudyDate = today;
                     streakChanged = true;
                 } else {
-                    const days = diffDays(today, user.lastStudyDate);
+                    const days = diffDaysWithOffset(today, user.lastStudyDate, VN_TZ_OFFSET_MIN);
+
                     if (days === 1) {
                         user.currentStreak = Number(user.currentStreak || 0) + 1;
                         user.longestStreak = Math.max(Number(user.longestStreak || 0), user.currentStreak);
@@ -1613,6 +1658,7 @@ module.exports = {
                     }
                 }
 
+                // UserActivity theo ngày VN (không bị lệch UTC)
                 await UserActivity.updateOne(
                     { userId: user._id, activityDate: today },
                     { $setOnInsert: { userId: user._id, activityDate: today, wasFrozen: false } },
@@ -1812,10 +1858,14 @@ module.exports = {
             return res.json({
                 attempt: {
                     attemptId: attempt._id,
+                    mode: attempt.mode,
+                    topicId: attempt.topicId ?? null,
+                    level: attempt.level ?? null,
                     totalQuestions: attempt.totalQuestions,
                     correctAnswers: attempt.correctAnswers,
                     earnedXP: attempt.earnedXP,
                     status: attempt.status,
+                    finishedAt: attempt.finishedAt ?? null,
                 },
                 xpMeta: {
                     baseXP: xpBase,
@@ -1836,6 +1886,7 @@ module.exports = {
             session.endSession();
         }
     },
+
 
     /**
      * GET /quiz-attempts?mode=&topicId=&from=&to=&page=1&pageSize=20
