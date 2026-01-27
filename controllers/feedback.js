@@ -347,4 +347,20 @@ module.exports = {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
+
+    // =========================
+    // GET /feedback/form
+    // =========================
+    async getFormLink(req, res) {
+        try {
+            // hardcode tạm link form
+            const formLink = "Chưa có link";
+            return res.json({
+                message: "Lấy link form feedback thành công.",
+                formLink,
+            });
+        } catch (e) {
+            return res.status(500).json({ message: "Lỗi server.", error: e.message });
+        }   
+    },
 };

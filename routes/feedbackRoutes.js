@@ -17,4 +17,7 @@ router.post("/", authMiddleware, feedbackController.createFeedback);
 router.put("/:feedbackId", authMiddleware, feedbackController.updateFeedback);
 router.delete("/:feedbackId", authMiddleware, feedbackController.deleteFeedback);
 
+// form 
+router.get("/form", feedbackController.getFormLink);
+
 module.exports = router;
