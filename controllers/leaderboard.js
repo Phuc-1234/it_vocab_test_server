@@ -40,8 +40,13 @@ module.exports = {
             let sort = {};
 
             if (tab === "xp") {
+
+                
                 match = {};
                 sort = { currentXP: -1, _id: 1 };
+
+
+
             } else if (tab === "streak") {
                 // ✅ SỬA LOGIC: Không check ngày nữa, chỉ cần có chuỗi > 0 là được hiện
                 match = { currentStreak: { $gt: 0 } };
