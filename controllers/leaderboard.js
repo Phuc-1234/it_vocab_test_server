@@ -8,7 +8,10 @@ const Item = require("../models/Item");
 
 // ✅ helper: lấy itemImageURL của SKIN đang equip
 async function getActiveSkinImageURL(userId) {
-    const uid = typeof userId === "string" ? new mongoose.Types.ObjectId(userId) : userId;
+    const uid =
+        typeof userId === "string"
+            ? new mongoose.Types.ObjectId(userId)
+            : userId;
 
     const rows = await UserEquipped.aggregate([
         { $match: { userId: uid, slotType: "SKIN" } },
@@ -28,6 +31,40 @@ async function getActiveSkinImageURL(userId) {
     return rows?.[0]?.itemImageURL ?? null;
 }
 
+// ✅ helper: calculate total XP for a user (sum of neededXP from all non-reset rank history)
+async function calculateTotalXP(userId) {
+    const uid =
+        typeof userId === "string"
+            ? new mongoose.Types.ObjectId(userId)
+            : userId;
+
+    const result = await UserRankHistory.aggregate([
+        {
+            $match: {
+                userId: uid,
+                resetReason: null,
+            },
+        },
+        {
+            $lookup: {
+                from: Rank.collection.name,
+                localField: "rankId",
+                foreignField: "_id",
+                as: "rank",
+            },
+        },
+        { $unwind: { path: "$rank", preserveNullAndEmptyArrays: true } },
+        {
+            $group: {
+                _id: null,
+                totalXP: { $sum: "$rank.neededXP" },
+            },
+        },
+    ]).exec();
+
+    return result?.[0]?.totalXP ?? 0;
+}
+
 module.exports = {
     async getLeaderboard(req, res) {
         try {
@@ -40,27 +77,81 @@ module.exports = {
             let sort = {};
 
             if (tab === "xp") {
-
-                
                 match = {};
-                sort = { currentXP: -1, _id: 1 };
-
-
-
+                sort = { totalXP: -1, _id: 1 };
             } else if (tab === "streak") {
                 // ✅ SỬA LOGIC: Không check ngày nữa, chỉ cần có chuỗi > 0 là được hiện
                 match = { currentStreak: { $gt: 0 } };
                 sort = { currentStreak: -1, _id: 1 };
             } else {
-                return res.status(400).json({ message: "Invalid tab parameter" });
+                return res
+                    .status(400)
+                    .json({ message: "Invalid tab parameter" });
             }
 
-            const userListRaw = await User.aggregate([
-                { $match: match },
-                { $sort: sort },
-                { $limit: 10 },
+            // ✅ Build aggregation pipeline
+            let aggregationPipeline = [{ $match: match }, { $limit: 10 }];
 
-                // ✅ lookup current rank history -> rank
+            // ✅ For XP tab: add totalXP from UserRankHistory sum
+            if (tab === "xp") {
+                aggregationPipeline.push(
+                    {
+                        $lookup: {
+                            from: UserRankHistory.collection.name,
+                            let: { uid: "$_id" },
+                            pipeline: [
+                                {
+                                    $match: {
+                                        $expr: {
+                                            $and: [
+                                                { $eq: ["$userId", "$$uid"] },
+                                                { $eq: ["$resetReason", null] },
+                                            ],
+                                        },
+                                    },
+                                },
+                                {
+                                    $lookup: {
+                                        from: Rank.collection.name,
+                                        localField: "rankId",
+                                        foreignField: "_id",
+                                        as: "rank",
+                                    },
+                                },
+                                {
+                                    $unwind: {
+                                        path: "$rank",
+                                        preserveNullAndEmptyArrays: true,
+                                    },
+                                },
+                                {
+                                    $group: {
+                                        _id: null,
+                                        totalXP: { $sum: "$rank.neededXP" },
+                                    },
+                                },
+                            ],
+                            as: "rankHistorySummary",
+                        },
+                    },
+                    {
+                        $unwind: {
+                            path: "$rankHistorySummary",
+                            preserveNullAndEmptyArrays: true,
+                        },
+                    },
+                    {
+                        $addFields: {
+                            totalXP: {
+                                $ifNull: ["$rankHistorySummary.totalXP", 0],
+                            },
+                        },
+                    },
+                );
+            }
+
+            // ✅ lookup current rank history -> rank
+            aggregationPipeline.push(
                 {
                     $lookup: {
                         from: UserRankHistory.collection.name,
@@ -85,7 +176,12 @@ module.exports = {
                                     as: "rank",
                                 },
                             },
-                            { $unwind: { path: "$rank", preserveNullAndEmptyArrays: true } },
+                            {
+                                $unwind: {
+                                    path: "$rank",
+                                    preserveNullAndEmptyArrays: true,
+                                },
+                            },
                             {
                                 $project: {
                                     _id: 0,
@@ -96,20 +192,31 @@ module.exports = {
                         as: "currentRank",
                     },
                 },
-                { $unwind: { path: "$currentRank", preserveNullAndEmptyArrays: true } },
-
                 {
-                    $project: {
-                        _id: 1,
-                        name: 1,
-                        avatarURL: 1,
-                        currentXP: 1,
-                        currentStreak: 1,
-                        // lastStudyDate: 1, // Không cần thiết trả về nữa
-                        currentRank: 1,
+                    $unwind: {
+                        path: "$currentRank",
+                        preserveNullAndEmptyArrays: true,
                     },
                 },
-            ]);
+            );
+
+            // ✅ Add sort after all lookups
+            aggregationPipeline.push({ $sort: sort });
+
+            // ✅ Project fields
+            aggregationPipeline.push({
+                $project: {
+                    _id: 1,
+                    name: 1,
+                    avatarURL: 1,
+                    currentXP: 1,
+                    currentStreak: 1,
+                    totalXP: tab === "xp" ? 1 : 0,
+                    currentRank: 1,
+                },
+            });
+
+            const userListRaw = await User.aggregate(aggregationPipeline);
 
             // ✅ position chỉ khi có token
             let myPosition = null;
@@ -119,12 +226,25 @@ module.exports = {
 
                 if (me) {
                     if (tab === "xp") {
-                        const betterCount = await User.countDocuments({
-                            $or: [
-                                { currentXP: { $gt: me.currentXP } },
-                                { currentXP: me.currentXP, _id: { $lt: me._id } },
-                            ],
-                        });
+                        // ✅ Calculate user's total XP
+                        const myTotalXP = await calculateTotalXP(userId);
+
+                        // ✅ Count users with better total XP
+                        const allUsers = await User.find({}).lean();
+                        let betterCount = 0;
+
+                        for (const user of allUsers) {
+                            const userTotalXP = await calculateTotalXP(
+                                user._id,
+                            );
+                            if (
+                                userTotalXP > myTotalXP ||
+                                (userTotalXP === myTotalXP && user._id < me._id)
+                            ) {
+                                betterCount++;
+                            }
+                        }
+
                         myPosition = betterCount + 1;
                     }
 
@@ -134,8 +254,15 @@ module.exports = {
                             const betterCount = await User.countDocuments({
                                 ...match, // currentStreak > 0
                                 $or: [
-                                    { currentStreak: { $gt: me.currentStreak } },
-                                    { currentStreak: me.currentStreak, _id: { $lt: me._id } },
+                                    {
+                                        currentStreak: {
+                                            $gt: me.currentStreak,
+                                        },
+                                    },
+                                    {
+                                        currentStreak: me.currentStreak,
+                                        _id: { $lt: me._id },
+                                    },
                                 ],
                             });
                             myPosition = betterCount + 1;
@@ -152,19 +279,21 @@ module.exports = {
                 userListRaw.map(async (u, index) => {
                     const isTop3 = index < 3;
 
-                    const itemImageURL = isTop3 ? await getActiveSkinImageURL(u._id) : null;
+                    const itemImageURL = isTop3
+                        ? await getActiveSkinImageURL(u._id)
+                        : null;
 
                     return {
                         userID: u._id,
                         rank: index + 1,
                         name: u.name ?? "User",
                         avatarURL: u.avatarURL ?? null,
-                        value: tab === "xp" ? u.currentXP : u.currentStreak,
+                        value: tab === "xp" ? u.totalXP : u.currentStreak,
 
                         rankLevel: u.currentRank?.rankLevel ?? null,
                         itemImageURL: itemImageURL ?? null,
                     };
-                })
+                }),
             );
 
             return res.status(200).json({
