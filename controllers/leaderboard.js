@@ -28,11 +28,12 @@ async function getActiveSkinImageURL(userId) {
     return rows?.[0]?.itemImageURL ?? null;
 }
 
-// ✅ helper: calculate total XP for a user (sum of neededXP from all non-reset rank history)
+// ✅ helper: totalXP = sum(rank.neededXP non-reset) + currentXP
 async function calculateTotalXP(userId) {
     const uid = typeof userId === "string" ? new mongoose.Types.ObjectId(userId) : userId;
 
-    const result = await UserRankHistory.aggregate([
+    // sum rank.neededXP (non-reset)
+    const rankSumAgg = await UserRankHistory.aggregate([
         { $match: { userId: uid, resetReason: null } },
         {
             $lookup: {
@@ -43,10 +44,16 @@ async function calculateTotalXP(userId) {
             },
         },
         { $unwind: { path: "$rank", preserveNullAndEmptyArrays: true } },
-        { $group: { _id: null, totalXP: { $sum: "$rank.neededXP" } } },
+        { $group: { _id: null, totalRankXP: { $sum: "$rank.neededXP" } } },
     ]).exec();
 
-    return result?.[0]?.totalXP ?? 0;
+    const totalRankXP = rankSumAgg?.[0]?.totalRankXP ?? 0;
+
+    // add currentXP from User
+    const user = await User.findById(uid).select("currentXP").lean();
+    const currentXP = Number(user?.currentXP ?? 0);
+
+    return totalRankXP + currentXP;
 }
 
 module.exports = {
@@ -64,6 +71,10 @@ module.exports = {
 
             const pipeline = [{ $match: matchBase }];
 
+            // =========================
+            // TAB: XP
+            // totalXP = sum(rank.neededXP non-reset) + currentXP
+            // =========================
             if (tab === "xp") {
                 pipeline.push(
                     {
@@ -90,18 +101,30 @@ module.exports = {
                                     },
                                 },
                                 { $unwind: { path: "$rank", preserveNullAndEmptyArrays: true } },
-                                { $group: { _id: null, totalXP: { $sum: "$rank.neededXP" } } },
+                                { $group: { _id: null, totalRankXP: { $sum: "$rank.neededXP" } } },
                             ],
-                            as: "rankHistorySummary",
+                            as: "rankSum",
                         },
                     },
-                    { $unwind: { path: "$rankHistorySummary", preserveNullAndEmptyArrays: true } },
-                    { $addFields: { totalXP: { $ifNull: ["$rankHistorySummary.totalXP", 0] } } },
+                    { $addFields: { rankSum: { $arrayElemAt: ["$rankSum", 0] } } },
+                    {
+                        $addFields: {
+                            totalXP: {
+                                $add: [
+                                    { $ifNull: ["$rankSum.totalRankXP", 0] },
+                                    { $ifNull: ["$currentXP", 0] },
+                                ],
+                            },
+                        },
+                    },
                     { $sort: { totalXP: -1, _id: 1 } },
                     { $limit: 10 },
                 );
             } else {
-                // ✅ streak: chỉ cần streak cao nhất, không check ngày
+                // =========================
+                // TAB: STREAK
+                // chỉ cần streak cao nhất, không check ngày
+                // =========================
                 pipeline.push(
                     { $match: { currentStreak: { $gt: 0 } } },
                     { $sort: { currentStreak: -1, _id: 1 } },
@@ -109,7 +132,7 @@ module.exports = {
                 );
             }
 
-            // lookup current rank history -> rankLevel (để sau limit cho nhẹ)
+            // ✅ lookup current rank history -> rankLevel (để sau limit cho nhẹ)
             pipeline.push(
                 {
                     $lookup: {
@@ -144,15 +167,15 @@ module.exports = {
                 { $unwind: { path: "$currentRank", preserveNullAndEmptyArrays: true } },
             );
 
-            // ✅ Project: KHÔNG mix include/exclude. Chỉ include các field cần.
-            // totalXP/effectiveStreak không cần "0/1 theo tab" ở đây.
+            // ✅ Project: KHÔNG mix include/exclude. Chỉ include field cần.
             pipeline.push({
                 $project: {
                     _id: 1,
                     name: 1,
                     avatarURL: 1,
                     currentStreak: 1,
-                    totalXP: 1, // xp tab thì có, streak tab thì field có thể undefined -> ok
+                    currentXP: 1,
+                    totalXP: 1, // xp tab thì có, streak tab thì undefined -> ok
                     currentRank: 1,
                 },
             });
@@ -163,7 +186,7 @@ module.exports = {
             let myPosition = null;
 
             if (userId) {
-                const me = await User.findOne({ _id: userId, status: "ACTIVE" }).lean();
+                const me = await User.findOne({ _id: userId, status: "ACTIVE" }).select("_id currentStreak").lean();
 
                 if (me) {
                     if (tab === "streak") {
@@ -185,19 +208,21 @@ module.exports = {
                     if (tab === "xp") {
                         const myTotalXP = await calculateTotalXP(userId);
 
-                        // (Giữ logic của bạn) nhưng lọc ACTIVE + chỉ lấy _id cho nhẹ hơn
+                        // lọc ACTIVE + chỉ lấy _id cho nhẹ hơn
                         const allUsers = await User.find({ status: "ACTIVE" }).select("_id").lean();
 
                         let betterCount = 0;
+                        const meId = String(me._id);
+
                         for (const u of allUsers) {
                             const userTotalXP = await calculateTotalXP(u._id);
-                            if (
-                                userTotalXP > myTotalXP ||
-                                (userTotalXP === myTotalXP && String(u._id) < String(me._id))
-                            ) {
+                            const uId = String(u._id);
+
+                            if (userTotalXP > myTotalXP || (userTotalXP === myTotalXP && uId < meId)) {
                                 betterCount++;
                             }
                         }
+
                         myPosition = betterCount + 1;
                     }
                 }
@@ -214,7 +239,7 @@ module.exports = {
                         rank: index + 1,
                         name: u.name ?? "User",
                         avatarURL: u.avatarURL ?? null,
-                        value: tab === "xp" ? (u.totalXP ?? 0) : (u.currentStreak ?? 0),
+                        value: tab === "xp" ? Number(u.totalXP ?? 0) : Number(u.currentStreak ?? 0),
                         rankLevel: u.currentRank?.rankLevel ?? null,
                         itemImageURL: itemImageURL ?? null,
                     };

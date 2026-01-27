@@ -33,27 +33,17 @@ function shuffleCopy(arr) {
 // ===== TZ helpers (VN / Asia/Ho_Chi_Minh = UTC+7) =====
 const VN_TZ_OFFSET_MIN = 7 * 60;
 
-// Trả về "00:00 của ngày đó" theo timezone offset, nhưng dưới dạng Date UTC (để lưu DB nhất quán)
 function startOfDayWithOffset(date, tzOffsetMin = 0) {
-    const d = new Date(date);
-
-    // ms UTC
-    const utcMs = d.getTime() + d.getTimezoneOffset() * 60 * 1000;
-
-    // ms theo TZ target
-    const tzMs = utcMs + tzOffsetMin * 60 * 1000;
-    const tzDate = new Date(tzMs);
-    tzDate.setHours(0, 0, 0, 0);
-
-    // đổi ngược về UTC ms để lưu DB
-    const backUtcMs = tzDate.getTime() - tzOffsetMin * 60 * 1000;
-    return new Date(backUtcMs);
+    const ms = new Date(date).getTime();
+    const shifted = new Date(ms + tzOffsetMin * 60 * 1000); // đưa về "giờ local" của TZ muốn tính
+    shifted.setUTCHours(0, 0, 0, 0); // set 00:00 theo TZ đó (dựa trên UTC của shifted)
+    return new Date(shifted.getTime() - tzOffsetMin * 60 * 1000); // trả về UTC Date để lưu DB
 }
 
 function diffDaysWithOffset(a, b, tzOffsetMin = 0) {
     const a0 = startOfDayWithOffset(a, tzOffsetMin).getTime();
     const b0 = startOfDayWithOffset(b, tzOffsetMin).getTime();
-    return Math.floor((a0 - b0) / (24 * 60 * 60 * 1000));
+    return Math.floor((a0 - b0) / 86400000);
 }
 
 
@@ -1429,31 +1419,6 @@ module.exports = {
     async finish(req, res) {
         const session = await mongoose.startSession();
         session.startTransaction();
-
-        // ===== TZ helpers (VN / Asia/Ho_Chi_Minh = UTC+7) =====
-        const VN_TZ_OFFSET_MIN = 7 * 60;
-
-        function startOfDayWithOffset(date, tzOffsetMin = 0) {
-            const d = new Date(date);
-
-            // ms UTC
-            const utcMs = d.getTime() + d.getTimezoneOffset() * 60 * 1000;
-
-            // ms theo TZ target
-            const tzMs = utcMs + tzOffsetMin * 60 * 1000;
-            const tzDate = new Date(tzMs);
-            tzDate.setHours(0, 0, 0, 0);
-
-            // đổi ngược về UTC ms để lưu DB nhất quán
-            const backUtcMs = tzDate.getTime() - tzOffsetMin * 60 * 1000;
-            return new Date(backUtcMs);
-        }
-
-        function diffDaysWithOffset(a, b, tzOffsetMin = 0) {
-            const a0 = startOfDayWithOffset(a, tzOffsetMin).getTime();
-            const b0 = startOfDayWithOffset(b, tzOffsetMin).getTime();
-            return Math.floor((a0 - b0) / (24 * 60 * 60 * 1000));
-        }
 
         try {
             const { attemptId } = req.params;
