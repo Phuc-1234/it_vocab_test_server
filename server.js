@@ -72,28 +72,35 @@ const swaggerOptions = {
   apis: ['./routes/*.js'],
 };
 
+const authLimiterDurationMinutes = 5;
+const authLimiterMaxRequests = 50;
+
+const generalLimiterDurationMinutes = 5;
+const generalLimiterMaxRequests = 400;
+
+
 
 const generalLimiter = rateLimit({
-  windowMs: 5 * 60 * 1000, // 5 minutes
-  max: 500, //   500/5' -> 100/1'
+  windowMs: generalLimiterDurationMinutes * 60 * 1000, // 5 minutes
+  max: generalLimiterMaxRequests, 
   message: { message: "Quá nhiều yêu cầu, vui lòng thử lại sau 5 phút." },
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => {
-    sendRateLimitEmailAlert(req.ip, 'General Limiter', 5 * 60 * 1000, 500);
+    sendRateLimitEmailAlert(req.ip, 'General Limiter', generalLimiterDurationMinutes * 60 * 1000, generalLimiterMaxRequests);
     res.status(429).json({ message: "Quá nhiều yêu cầu, vui lòng thử lại sau 5 phút." });
   },
 });
 
-const authLimiterDurationMinutes = 5;
+
 const authLimiter = rateLimit({
   windowMs: authLimiterDurationMinutes * 60 * 1000, // 5'
-  max: 150, //  150/5' -> 30/1'
+  max: authLimiterMaxRequests, 
   message: { message: "Thử đăng nhập quá nhiều lần. Tài khoản tạm khóa 5 phut nha." },
   standardHeaders: true,
   legacyHeaders: false,
   handler: (req, res) => {
-    sendRateLimitEmailAlert(req.ip, 'Auth Limiter', authLimiterDurationMinutes * 60 * 1000, 150);
+    sendRateLimitEmailAlert(req.ip, 'Auth Limiter', authLimiterDurationMinutes * 60 * 1000, authLimiterMaxRequests);
     res.status(429).json({ message: "Thử đăng nhập quá nhiều lần. Tài khoản tạm khóa 5 phut nha." });
   },
 });
