@@ -2,6 +2,18 @@ require("dotenv").config();
 const express = require("express");
 const { sendRateLimitAlert } = require("./services/mail");
 
+const mongoose = require('mongoose');
+const authRoutes = require("./routes/authRoutes")
+const quizRoutes = require("./routes/quizRoutes")
+const topicRoutes = require("./routes/topicRoutes")
+const profileRoutes = require("./routes/profileRoutes")
+const dictionaryRoutes = require("./routes/dictionaryRoutes")
+const feedbackRoutes = require("./routes/feedbackRoutes")
+const itemRoutes = require("./routes/itemRoutes")
+const rewardRoutes = require("./routes/rewardRoutes")
+const inventoryRoutes = require("./routes/inventoryRoutes")
+const leaderboardRoutes = require("./routes/leaderboardRoutes")
+const helmet = require('helmet');
 const mongoose = require("mongoose");
 const authRoutes = require("./routes/authRoutes");
 const quizRoutes = require("./routes/quizRoutes");
@@ -129,6 +141,7 @@ app.use(helmet());
 app.use(cors());
 app.set("trust proxy", 1); // để rate-limit bỏ qua proxy của render, nhìn ip của người dùng
 app.use(express.json()); // Allows parsing of JSON bodies
+app.use(mongoSanitize()); // de ngay sau express.json()
 
 // Simple sanitizer for request `body` and `params` only.
 // This avoids modifying the read-only `req.query` property which causes the TypeError.
