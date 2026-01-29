@@ -14,14 +14,16 @@ const itemRoutes = require("./routes/itemRoutes")
 const rewardRoutes = require("./routes/rewardRoutes")
 const inventoryRoutes = require("./routes/inventoryRoutes")
 const leaderboardRoutes = require("./routes/leaderboardRoutes")
+const helmet = require('helmet');
 const app = express();
 const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
 const swaggerJsdoc = require('swagger-jsdoc');
 const rateLimit = require('express-rate-limit');
+const mongoSanitize = require('express-mongo-sanitize');
 
 
-app.set('trust proxy', 1); // để rate-limit bỏ qua proxy của render, nhìn ip của người dùng
+
 
 // Track rate limit alerts to prevent spam (one alert per IP per time window)
 const rateLimitAlerts = new Map();
@@ -104,12 +106,13 @@ const authLimiter = rateLimit({
     res.status(429).json({ message: "Thử đăng nhập quá nhiều lần. Tài khoản tạm khóa 5 phut nha." });
   },
 });
-
-app.use(cors());
 const swaggerDocs = swaggerJsdoc(swaggerOptions);
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerDocs));
 
+app.use(helmet());
+app.use(cors());
+app.set('trust proxy', 1); // để rate-limit bỏ qua proxy của render, nhìn ip của người dùng
 app.use(express.json()); // Allows parsing of JSON bodies
+app.use(mongoSanitize()); // de ngay sau express.json()
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI)
