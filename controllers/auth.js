@@ -248,6 +248,7 @@ module.exports = {
                 ...tokens,
                 user: {
                     userId: String(user._id),
+                    role: user.role, // <--- THÊM DÒNG NÀY
                     currentXP: user.currentXP ?? 0,
                     currentStreak: user.currentStreak ?? 0,
                     longestStreak: user.longestStreak ?? 0,
@@ -258,7 +259,6 @@ module.exports = {
             return res.status(500).json({ message: "Lỗi server.", error: e.message });
         }
     },
-
     // POST /auth/send-code { email, purpose }
     async sendCode(req, res) {
         try {

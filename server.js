@@ -14,6 +14,7 @@ const itemRoutes = require("./routes/itemRoutes")
 const rewardRoutes = require("./routes/rewardRoutes")
 const inventoryRoutes = require("./routes/inventoryRoutes")
 const leaderboardRoutes = require("./routes/leaderboardRoutes")
+const adminRoutes = require("./routes/adminRoutes")
 const app = express();
 const cors = require('cors');
 const swaggerUi = require('swagger-ui-express');
@@ -29,29 +30,29 @@ const rateLimitAlerts = new Map();
 
 const recipientEmail = 'vdp.hh.1234@gmail.com, lieuthienhao2006@gmail.com';
 const sendRateLimitEmailAlert = async (ip, limiterType, windowMs, maxRequests) => {
-    const now = Date.now();
-    const alertKey = `${ip}-${limiterType}`;
-    const lastAlert = rateLimitAlerts.get(alertKey) || 0;
-    
-    // Only send email once per 15' per IP per limiter type to avoid spam
-    if (now - lastAlert > 15 * 60 * 1000) {
-        rateLimitAlerts.set(alertKey, now);
+  const now = Date.now();
+  const alertKey = `${ip}-${limiterType}`;
+  const lastAlert = rateLimitAlerts.get(alertKey) || 0;
+
+  // Only send email once per 15' per IP per limiter type to avoid spam
+  if (now - lastAlert > 15 * 60 * 1000) {
+    rateLimitAlerts.set(alertKey, now);
 
 
 
-        try {
-            await sendRateLimitAlert(
-                recipientEmail,
-                ip,
-                limiterType,
-                windowMs,
-                maxRequests
-            );
-            console.log(`[Rate Limit Alert] Email sent for IP: ${ip} (${limiterType})`);
-        } catch (err) {
-            console.error(`[Rate Limit Alert] Failed to send email for IP ${ip}:`, err.message);
-        }
+    try {
+      await sendRateLimitAlert(
+        recipientEmail,
+        ip,
+        limiterType,
+        windowMs,
+        maxRequests
+      );
+      console.log(`[Rate Limit Alert] Email sent for IP: ${ip} (${limiterType})`);
+    } catch (err) {
+      console.error(`[Rate Limit Alert] Failed to send email for IP ${ip}:`, err.message);
     }
+  }
 };
 
 const swaggerOptions = {
@@ -82,7 +83,7 @@ const generalLimiterMaxRequests = 400;
 
 const generalLimiter = rateLimit({
   windowMs: generalLimiterDurationMinutes * 60 * 1000, // 5 minutes
-  max: generalLimiterMaxRequests, 
+  max: generalLimiterMaxRequests,
   message: { message: "Quá nhiều yêu cầu, vui lòng thử lại sau 5 phút." },
   standardHeaders: true,
   legacyHeaders: false,
@@ -95,7 +96,7 @@ const generalLimiter = rateLimit({
 
 const authLimiter = rateLimit({
   windowMs: authLimiterDurationMinutes * 60 * 1000, // 5'
-  max: authLimiterMaxRequests, 
+  max: authLimiterMaxRequests,
   message: { message: "Thử đăng nhập quá nhiều lần. Tài khoản tạm khóa 5 phut nha." },
   standardHeaders: true,
   legacyHeaders: false,
@@ -131,6 +132,7 @@ app.use('/item', itemRoutes);
 app.use('/reward', rewardRoutes);
 app.use('/inventory', inventoryRoutes);
 app.use('/leaderboard', leaderboardRoutes);
+app.use('/admin', adminRoutes);
 
 
 const PORT = process.env.PORT || 5000;
