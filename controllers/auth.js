@@ -248,7 +248,7 @@ module.exports = {
                 ...tokens,
                 user: {
                     userId: String(user._id),
-                    role: user.role, // <--- THÊM DÒNG NÀY
+                    role: user.role,
                     currentXP: user.currentXP ?? 0,
                     currentStreak: user.currentStreak ?? 0,
                     longestStreak: user.longestStreak ?? 0,
